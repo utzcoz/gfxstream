@@ -1,0 +1,51 @@
+From 78d10f3a90925799b9e7ad0a457547edfd6d951e Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sun, 26 Jul 2026 11:37:24 +0800
+Subject: [PATCH 6/6] gfxstream/guest: enable the fd-based external memory
+ paths on Apple
+
+AndroidHardwareBuffer.cpp needs the DRM fourcc codes to describe buffer
+formats, and GfxStreamVulkanMapper imports host memory through a file
+descriptor. Both are compiled for Linux only, which leaves the kumquat guest
+platform unbuildable on Apple platforms.
+
+The fourcc codes are plain constants and apply as they are. The Vulkan
+mapper builds, but is not known to work there: kumquat never produces a
+dma-buf handle on Apple, and the remaining opaque-fd path needs
+VK_KHR_external_memory_fd, which MoltenVK does not implement. Say so, so
+that it is not mistaken for a tested path.
+---
+ .../kumquat/vulkan-mapper/GfxStreamVulkanMapper.cpp         | 6 +++++-
+ src/gfxstream/guest/vulkan_enc/AndroidHardwareBuffer.cpp    | 2 +-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/gfxstream/guest/platform/kumquat/vulkan-mapper/GfxStreamVulkanMapper.cpp b/src/gfxstream/guest/platform/kumquat/vulkan-mapper/GfxStreamVulkanMapper.cpp
+index 87dac8b..278ac98 100644
+--- a/src/gfxstream/guest/platform/kumquat/vulkan-mapper/GfxStreamVulkanMapper.cpp
++++ b/src/gfxstream/guest/platform/kumquat/vulkan-mapper/GfxStreamVulkanMapper.cpp
+@@ -257,7 +257,11 @@ int32_t GfxStreamVulkanMapper::map(struct VulkanMapperData* mapData) {
+         L"",
+     };
+ 
+-#elif DETECT_OS_LINUX
++// On Apple platforms this builds so that the kumquat guest platform links, but it
++// is not known to work: kumquat never produces a dma-buf handle there, and the
++// remaining opaque-fd path needs VK_KHR_external_memory_fd, which MoltenVK does
++// not implement.
++#elif DETECT_OS_LINUX || DETECT_OS_APPLE
+     VkExternalMemoryHandleTypeFlagBits flagBits;
+     if (mapData->handleType == VIRTGPU_KUMQUAT_HANDLE_TYPE_MEM_DMABUF) {
+         flagBits = (enum VkExternalMemoryHandleTypeFlagBits)(uint32_t(VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT));
+diff --git a/src/gfxstream/guest/vulkan_enc/AndroidHardwareBuffer.cpp b/src/gfxstream/guest/vulkan_enc/AndroidHardwareBuffer.cpp
+index 8450fbe..f7f49ff 100644
+--- a/src/gfxstream/guest/vulkan_enc/AndroidHardwareBuffer.cpp
++++ b/src/gfxstream/guest/vulkan_enc/AndroidHardwareBuffer.cpp
+@@ -5,7 +5,7 @@
+ #include "AndroidHardwareBuffer.h"
+ #include "util/detect_os.h"
+ 
+-#if DETECT_OS_ANDROID || DETECT_OS_LINUX
++#if DETECT_OS_ANDROID || DETECT_OS_LINUX || DETECT_OS_APPLE
+ #include <drm_fourcc.h>
+ #define DRM_FORMAT_YVU420_ANDROID fourcc_code('9', '9', '9', '7')
+ #define DRM_FORMAT_D16_UNORM fourcc_code('9', '9', '9', '6')

@@ -14,6 +14,7 @@ string_flag(
         "host",
         "gles_angle_vulkan_lavapipe",
         "gles_angle_vulkan_swiftshader",
+        "gles_angle_vulkan_moltenvk",
     ],
 )
 
@@ -38,6 +39,13 @@ config_setting(
     },
 )
 
+config_setting(
+    name = "graphics_test_environment_gles_angle_vulkan_moltenvk",
+    flag_values = {
+        ":graphics_test_environment": "gles_angle_vulkan_moltenvk",
+    },
+)
+
 copy_to_directory(
     name = "graphics_test_environment_drivers",
     srcs = select({
@@ -54,6 +62,12 @@ copy_to_directory(
             "@angle//:libEGL",
             "@angle//:libGLESv2",
             "@swiftshader//:vk_swiftshader",
+        ],
+        # macOS: ANGLE for GLES, running on top of the system MoltenVK Vulkan
+        # driver (provided at runtime, not as a Bazel artifact).
+        ":graphics_test_environment_gles_angle_vulkan_moltenvk": [
+            "@angle//:libEGL",
+            "@angle//:libGLESv2",
         ],
         "//conditions:default": [
             # Default does not change anything and uses host drivers.
@@ -85,6 +99,9 @@ cc_library(
         ":graphics_test_environment_gles_angle_vulkan_swiftshader": [
             ":graphics_test_environment_drivers",
         ],
+        ":graphics_test_environment_gles_angle_vulkan_moltenvk": [
+            ":graphics_test_environment_drivers",
+        ],
         "//conditions:default": [],
     }),
     defines = select({
@@ -96,6 +113,10 @@ cc_library(
             "GFXSTREAM_TESTING_USE_GLES_ANGLE",
             "GFXSTREAM_TESTING_USE_VULKAN_SWIFTSHADER",
         ],
+        ":graphics_test_environment_gles_angle_vulkan_moltenvk": [
+            "GFXSTREAM_TESTING_USE_GLES_ANGLE",
+            "GFXSTREAM_TESTING_USE_VULKAN_MOLTENVK",
+        ],
         "//conditions:default": [
             # Default does not change anything and uses host drivers.
         ],
@@ -106,6 +127,9 @@ cc_library(
             "@rules_cc//cc/runfiles",
         ],
         ":graphics_test_environment_gles_angle_vulkan_swiftshader": [
+            "@rules_cc//cc/runfiles",
+        ],
+        ":graphics_test_environment_gles_angle_vulkan_moltenvk": [
             "@rules_cc//cc/runfiles",
         ],
         "//conditions:default": [],

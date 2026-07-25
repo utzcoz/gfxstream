@@ -20,7 +20,9 @@
 #include <poll.h>
 #include <qemu_pipe_bp.h>
 #include <time.h>
+#if !defined(__APPLE__)
 #include <xf86drm.h>
+#endif
 
 #include <atomic>
 #include <vector>

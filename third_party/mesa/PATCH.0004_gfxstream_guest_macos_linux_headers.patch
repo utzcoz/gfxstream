@@ -1,0 +1,106 @@
+From 52d8d8faee999bf86c61fd189b8a941a445b272b Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sun, 26 Jul 2026 11:37:24 +0800
+Subject: [PATCH 4/6] gfxstream/guest: build the goldfish paths without Linux
+ uapi headers
+
+goldfish_sync.h and goldfish_address_space.cpp include <linux/ioctl.h> and
+<linux/types.h> unconditionally, which do not exist outside Linux, and the
+address space code spells its ioctl payloads with the __u64 and __u32 types
+those headers provide.
+
+Include the uapi headers only on Linux and use the standard fixed-width
+types instead. Names beginning with a double underscore are reserved for the
+implementation, so they cannot simply be typedef'd on platforms that do not
+already have them. Apple has no mmap64 either, since off_t is 64-bit there
+to begin with; give it a local definition rather than a macro.
+
+The runtime paths here are Android-only. This only makes the file build.
+---
+ .../goldfish_address_space.cpp                | 26 ++++++++++++++-----
+ .../include/gfxstream/guest/goldfish_sync.h   |  4 +++
+ 2 files changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/src/gfxstream/guest/GoldfishAddressSpace/goldfish_address_space.cpp b/src/gfxstream/guest/GoldfishAddressSpace/goldfish_address_space.cpp
+index b069bef..5085aa8 100644
+--- a/src/gfxstream/guest/GoldfishAddressSpace/goldfish_address_space.cpp
++++ b/src/gfxstream/guest/GoldfishAddressSpace/goldfish_address_space.cpp
+@@ -5,10 +5,15 @@
+ 
+ #include "goldfish_address_space.h"
+ 
++#include "util/detect_os.h"
++
+ #include <errno.h>
+ #include <fcntl.h>
++#include <stdint.h>
++#if DETECT_OS_LINUX
+ #include <linux/ioctl.h>
+ #include <linux/types.h>
++#endif
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+@@ -21,6 +26,13 @@
+ 
+ #include "util/log.h"
+ 
++#if DETECT_OS_APPLE
++// off_t is already 64-bit on Apple platforms, so there is no separate mmap64.
++static inline void* mmap64(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
++    return mmap(addr, len, prot, flags, fd, offset);
++}
++#endif
++
+ // See virgl_hw.h and p_defines.h
+ #define VIRGL_FORMAT_R8_UNORM 64
+ #define VIRGL_BIND_CUSTOM (1 << 17)
+@@ -35,23 +47,23 @@ static const size_t kPageSize = getpagesize();
+ namespace {
+ 
+ struct goldfish_address_space_allocate_block {
+-    __u64 size;
+-    __u64 offset;
+-    __u64 phys_addr;
++    uint64_t size;
++    uint64_t offset;
++    uint64_t phys_addr;
+ };
+ 
+ struct goldfish_address_space_claim_shared {
+-    __u64 offset;
+-    __u64 size;
++    uint64_t offset;
++    uint64_t size;
+ };
+ 
+ #define GOLDFISH_ADDRESS_SPACE_IOCTL_MAGIC		'G'
+ #define GOLDFISH_ADDRESS_SPACE_IOCTL_OP(OP, T)		_IOWR(GOLDFISH_ADDRESS_SPACE_IOCTL_MAGIC, OP, T)
+ #define GOLDFISH_ADDRESS_SPACE_IOCTL_ALLOCATE_BLOCK	GOLDFISH_ADDRESS_SPACE_IOCTL_OP(10, struct goldfish_address_space_allocate_block)
+-#define GOLDFISH_ADDRESS_SPACE_IOCTL_DEALLOCATE_BLOCK	GOLDFISH_ADDRESS_SPACE_IOCTL_OP(11, __u64)
++#define GOLDFISH_ADDRESS_SPACE_IOCTL_DEALLOCATE_BLOCK	GOLDFISH_ADDRESS_SPACE_IOCTL_OP(11, uint64_t)
+ #define GOLDFISH_ADDRESS_SPACE_IOCTL_PING		GOLDFISH_ADDRESS_SPACE_IOCTL_OP(12, struct address_space_ping)
+ #define GOLDFISH_ADDRESS_SPACE_IOCTL_CLAIM_SHARED		GOLDFISH_ADDRESS_SPACE_IOCTL_OP(13, struct goldfish_address_space_claim_shared)
+-#define GOLDFISH_ADDRESS_SPACE_IOCTL_UNCLAIM_SHARED		GOLDFISH_ADDRESS_SPACE_IOCTL_OP(14, __u64)
++#define GOLDFISH_ADDRESS_SPACE_IOCTL_UNCLAIM_SHARED		GOLDFISH_ADDRESS_SPACE_IOCTL_OP(14, uint64_t)
+ 
+ const char GOLDFISH_ADDRESS_SPACE_DEVICE_NAME[] = "/dev/goldfish_address_space";
+ 
+diff --git a/src/gfxstream/guest/android/include/gfxstream/guest/goldfish_sync.h b/src/gfxstream/guest/android/include/gfxstream/guest/goldfish_sync.h
+index d11112a..f48b247 100644
+--- a/src/gfxstream/guest/android/include/gfxstream/guest/goldfish_sync.h
++++ b/src/gfxstream/guest/android/include/gfxstream/guest/goldfish_sync.h
+@@ -9,9 +9,13 @@
+ #define GOLDFISH_SYNC_VULKAN_SEMAPHORE_SYNC 0x00000001
+ #define GOLDFISH_SYNC_VULKAN_QSRI 0x00000002
+ 
++#include "util/detect_os.h"
++
+ #include <errno.h>
++#if DETECT_OS_LINUX
+ #include <linux/ioctl.h>
+ #include <linux/types.h>
++#endif
+ #include <sys/cdefs.h>
+ #include <sys/ioctl.h>
+ #include <unistd.h>

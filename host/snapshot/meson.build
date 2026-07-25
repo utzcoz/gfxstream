@@ -3,7 +3,9 @@
 
 inc_host_snapshot = include_directories('include')
 
-files_lib_host_snapshot = files()
+files_lib_host_snapshot = files(
+  'snapshot_stub.cpp',
+)
 
 lib_host_snapshot = static_library(
   'host_snapshot',

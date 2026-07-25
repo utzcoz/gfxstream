@@ -1,10 +1,49 @@
 load("@bazel_skylib//lib:selects.bzl", "selects")
-load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library", "objc_library")
 load("@rules_python//python:defs.bzl", "py_binary")
 
 package(
     default_visibility = ["@//:gfxstream"],
 )
+
+# The Vulkan window-system-integration (display/surface) sources are
+# platform-specific. On Linux these are compiled directly; on macOS the
+# equivalents are Objective-C++ and are built in the `angle_apple` objc_library
+# below (cc_library can not compile .mm files).
+ANGLE_VULKAN_LINUX_WSI_SRCS = [
+    "src/libANGLE/renderer/vulkan/linux/DeviceVkLinux.cpp",
+    "src/libANGLE/renderer/vulkan/linux/DisplayVkLinux.cpp",
+    "src/libANGLE/renderer/vulkan/linux/DisplayVkOffscreen.cpp",
+    "src/libANGLE/renderer/vulkan/linux/DmaBufImageSiblingVkLinux.cpp",
+    "src/libANGLE/renderer/vulkan/linux/display/DisplayVkSimple.cpp",
+    "src/libANGLE/renderer/vulkan/linux/display/WindowSurfaceVkSimple.cpp",
+    "src/libANGLE/renderer/vulkan/linux/headless/DisplayVkHeadless.cpp",
+    "src/libANGLE/renderer/vulkan/linux/headless/WindowSurfaceVkHeadless.cpp",
+]
+
+# Linux-only local_defines. On macOS ANGLE selects its platform via the
+# compiler-provided __APPLE__ / ANGLE_PLATFORM_APPLE macros, uses the Metal/
+# IOSurface Vulkan display (not the Linux vulkan-display), and has no X11.
+ANGLE_PLATFORM_LOCAL_DEFINES = select({
+    "@platforms//os:macos": [],
+    "//conditions:default": [
+        "ANGLE_IS_LINUX",
+        "ANGLE_USE_VULKAN_DISPLAY",
+        "ANGLE_VULKAN_DISPLAY_MODE_OFFSCREEN",
+        "EGL_NO_X11",
+    ],
+})
+
+# Frameworks required by ANGLE's macOS Objective-C++ sources.
+ANGLE_APPLE_SDK_FRAMEWORKS = [
+    "AppKit",
+    "Cocoa",
+    "CoreGraphics",
+    "IOKit",
+    "IOSurface",
+    "Metal",
+    "QuartzCore",
+]
 
 cc_library(
     name = "angle_common",
@@ -31,13 +70,21 @@ cc_library(
         "src/common/platform_helpers.cpp",
         "src/common/string_utils.cpp",
         "src/common/system_utils.cpp",
-        "src/common/system_utils_linux.cpp",
         "src/common/system_utils_posix.cpp",
         "src/common/third_party/xxhash/xxhash.c",
         "src/common/tls.cpp",
         "src/common/uniform_type_info_autogen.cpp",
         "src/common/utilities.cpp",
-    ],
+    ] + select({
+        "@platforms//os:macos": [
+            "src/common/gl/cgl/FunctionsCGL.cpp",
+            "src/common/system_utils_apple.cpp",
+            "src/common/system_utils_mac.cpp",
+        ],
+        "//conditions:default": [
+            "src/common/system_utils_linux.cpp",
+        ],
+    }),
     hdrs = [
         "src/common/BinaryStream.h",
         "src/common/CircularBuffer.h",
@@ -103,7 +150,15 @@ cc_library(
         "src/common/utilities.h",
         "src/common/vector_utils.h",
         "src/libANGLE/CLBitField.h",
-    ],
+    ] + select({
+        "@platforms//os:macos": [
+            "src/common/apple/ObjCPtr.h",
+            "src/common/apple/SoftLinking.h",
+            "src/common/apple/apple_platform.h",
+            "src/common/gl/cgl/FunctionsCGL.h",
+        ],
+        "//conditions:default": [],
+    }),
     defines = [
         # TODO: use bazel `select({})` on debug build condition.
         # Useful for debugging:
@@ -209,6 +264,9 @@ cc_library(
         ],
     ) + select({
         "@platforms//os:linux": [
+            "third_party/glslang/src/glslang/OSDependent/Unix/ossource.cpp",
+        ],
+        "@platforms//os:macos": [
             "third_party/glslang/src/glslang/OSDependent/Unix/ossource.cpp",
         ],
         "@platforms//os:windows": [
@@ -475,9 +533,14 @@ cc_library(
     name = "angle_gpu_info_util",
     srcs = [
         "src/gpu_info_util/SystemInfo.cpp",
-        "src/gpu_info_util/SystemInfo_linux.cpp",
         "src/gpu_info_util/SystemInfo_vulkan.cpp",
-    ],
+    ] + select({
+        # macOS SystemInfo (.mm) is built in :angle_apple.
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+            "src/gpu_info_util/SystemInfo_linux.cpp",
+        ],
+    }),
     hdrs = [
         "src/gpu_info_util/SystemInfo.h",
         "src/gpu_info_util/SystemInfo_internal.h",
@@ -676,6 +739,12 @@ cc_library(
     hdrs = [
         "src/third_party/volk/volk.h",
     ],
+    # On macOS volk must define the Metal surface entry points (e.g.
+    # vkCreateMetalSurfaceEXT) that the mac WSI calls.
+    local_defines = select({
+        "@platforms//os:macos": ["VK_USE_PLATFORM_METAL_EXT"],
+        "//conditions:default": [],
+    }),
     includes = [
         "src/third_party/volk",
         "third_party/vulkan-headers/src/include",
@@ -1156,7 +1225,6 @@ cc_library(
     ],
     linkstatic = True,
     local_defines = [
-        'ANGLE_DISPATCH_LIBRARY=\\\"libGLESv2.so\\\"',
         'ANGLE_EGL_LIBRARY_NAME=\\"libEGL\\"',
         "ANGLE_ENABLE_CONTEXT_MUTEX=1",
         "ANGLE_ENABLE_SHARE_CONTEXT_LOCK=1",
@@ -1175,7 +1243,16 @@ cc_library(
         "GL_GLES_PROTOTYPES=1",
         "GL_GLEXT_PROTOTYPES",
         "LIBEGL_IMPLEMENTATION",
-    ],
+    ] + select({
+        # ANGLE appends the platform shared-library extension, so the name must
+        # not already include one (libGLESv2.dylib on macOS, libGLESv2.so else).
+        "@platforms//os:macos": [
+            'ANGLE_DISPATCH_LIBRARY=\\\"libGLESv2\\\"',
+        ],
+        "//conditions:default": [
+            'ANGLE_DISPATCH_LIBRARY=\\\"libGLESv2.so\\\"',
+        ],
+    }),
     deps = [
         ":angle_common",
         ":includes",
@@ -2112,14 +2189,6 @@ cc_library(
         "src/libANGLE/renderer/vulkan/VkImageImageSiblingVk.cpp",
         "src/libANGLE/renderer/vulkan/VulkanSecondaryCommandBuffer.cpp",
         "src/libANGLE/renderer/vulkan/android/vk_android_utils.cpp",
-        "src/libANGLE/renderer/vulkan/linux/DeviceVkLinux.cpp",
-        "src/libANGLE/renderer/vulkan/linux/DisplayVkLinux.cpp",
-        "src/libANGLE/renderer/vulkan/linux/DisplayVkOffscreen.cpp",
-        "src/libANGLE/renderer/vulkan/linux/DmaBufImageSiblingVkLinux.cpp",
-        "src/libANGLE/renderer/vulkan/linux/display/DisplayVkSimple.cpp",
-        "src/libANGLE/renderer/vulkan/linux/display/WindowSurfaceVkSimple.cpp",
-        "src/libANGLE/renderer/vulkan/linux/headless/DisplayVkHeadless.cpp",
-        "src/libANGLE/renderer/vulkan/linux/headless/WindowSurfaceVkHeadless.cpp",
         "src/libANGLE/renderer/vulkan/spv_utils.cpp",
         "src/libANGLE/renderer/vulkan/vk_cache_utils.cpp",
         "src/libANGLE/renderer/vulkan/vk_caps_utils.cpp",
@@ -2132,7 +2201,11 @@ cc_library(
         "src/libANGLE/renderer/vulkan/vk_renderer.cpp",
         "src/libANGLE/renderer/vulkan/vk_resource.cpp",
         "src/libANGLE/renderer/vulkan/vk_utils.cpp",
-    ],
+    ] + select({
+        # macOS uses the Metal/IOSurface Vulkan WSI, built in :angle_apple.
+        "@platforms//os:macos": [],
+        "//conditions:default": ANGLE_VULKAN_LINUX_WSI_SRCS,
+    }),
     hdrs = [
         "src/libANGLE/renderer/vulkan/AllocatorHelperPool.h",
         "src/libANGLE/renderer/vulkan/AllocatorHelperRing.h",
@@ -2387,19 +2460,98 @@ cc_library(
     alwayslink = True,
 )
 
+# ANGLE's macOS Objective-C++ sources: apple platform utilities, GPU info, and
+# the Metal/IOSurface Vulkan window-system-integration. These can not live in the
+# cc_library targets above (cc_library rejects .mm), so they are compiled here and
+# linked into the final libEGL/libGLESv2 shared libraries.
+objc_library(
+    name = "angle_apple",
+    srcs = [
+        "src/common/apple_platform_utils.mm",
+        "src/gpu_info_util/SystemInfo_apple.mm",
+        "src/gpu_info_util/SystemInfo_macos.mm",
+        "src/libANGLE/renderer/driver_utils_mac.mm",
+        "src/libANGLE/renderer/vulkan/mac/DisplayVkMac.h",
+        "src/libANGLE/renderer/vulkan/mac/DisplayVkMac.mm",
+        "src/libANGLE/renderer/vulkan/mac/IOSurfaceSurfaceVkMac.h",
+        "src/libANGLE/renderer/vulkan/mac/IOSurfaceSurfaceVkMac.mm",
+        "src/libANGLE/renderer/vulkan/mac/WindowSurfaceVkMac.h",
+        "src/libANGLE/renderer/vulkan/mac/WindowSurfaceVkMac.mm",
+    ],
+    # ANGLE's Objective-C++ uses manual reference counting. The -D flags mirror
+    # the local_defines of the cc_library targets whose headers these sources use
+    # (objc_library has no local_defines attribute).
+    copts = [
+        "-fno-objc-arc",
+        "-DANGLE_ENABLE_CONTEXT_MUTEX=1",
+        "-DANGLE_ENABLE_CRC_FOR_PIPELINE_CACHE",
+        "-DANGLE_ENABLE_SHARE_CONTEXT_LOCK=1",
+        "-DANGLE_ENABLE_VULKAN",
+        "-DANGLE_ENABLE_VULKAN_SHARED_RING_BUFFER_CMD_ALLOC=false",
+        "-DANGLE_OUTSIDE_WEBKIT",
+        "-DANGLE_PLATFORM_EXPORT=",
+        "-DANGLE_SHARED_LIBVULKAN=1",
+        "-DANGLE_USE_CUSTOM_VULKAN_OUTSIDE_RENDER_PASS_CMD_BUFFERS=1",
+        "-DANGLE_USE_CUSTOM_VULKAN_RENDER_PASS_CMD_BUFFERS=1",
+        "-DLIBANGLE_IMPLEMENTATION",
+        # Enable the Vulkan Metal surface extension (VkMetalSurfaceCreateInfoEXT,
+        # VK_EXT_METAL_SURFACE_EXTENSION_NAME, CAMetalLayer) used by the mac WSI.
+        "-DVK_USE_PLATFORM_METAL_EXT",
+    ],
+    includes = [
+        "include/",
+        "src/",
+        "src/common/base/",
+        "src/common/third_party/xxhash",
+        "third_party/spirv-headers/src/include/",
+        "third_party/vulkan-headers/src/include",
+    ],
+    sdk_frameworks = ANGLE_APPLE_SDK_FRAMEWORKS,
+    target_compatible_with = [
+        "@platforms//os:macos",
+    ],
+    deps = [
+        ":angle_common",
+        ":angle_gpu_info_util",
+        ":angle_image_util",
+        ":angle_libvulkan_loader",
+        ":angle_vk_mem_alloc_wrapper",
+        ":angle_volk",
+        ":angle_vulkan_backend",
+        ":angle_vulkan_entry_points",
+        ":angle_vulkan_headers",
+        ":libangle_headers",
+        ":vulkan",
+        "@abseil-cpp//absl/container:flat_hash_map",
+        "@abseil-cpp//absl/container:flat_hash_set",
+    ],
+    alwayslink = True,
+)
+
 cc_shared_library(
     name = "libEGL",
-    additional_linker_inputs = [
-        "@//third_party/angle:libEGL_angle.lds",
-    ],
-    shared_lib_name = "libEGL.so",
-    user_link_flags = [
-        "-ldl",
-        "-Wl,--gc-sections",
-        "-Wl,-rpath=$$ORIGIN",
-        "-Wl,--version-script=$(location @//third_party/angle:libEGL_angle.lds)",
-    ] + selects.with_or({
+    additional_linker_inputs = select({
+        "@platforms//os:macos": [],
+        "//conditions:default": ["@//third_party/angle:libEGL_angle.lds"],
+    }),
+    shared_lib_name = select({
+        "@platforms//os:macos": "libEGL.dylib",
+        "//conditions:default": "libEGL.so",
+    }),
+    user_link_flags = select({
+        "@platforms//os:macos": [
+            "-Wl,-dead_strip",
+            "-Wl,-rpath,@loader_path",
+        ],
+        "//conditions:default": [
+            "-ldl",
+            "-Wl,--gc-sections",
+            "-Wl,-rpath=$$ORIGIN",
+            "-Wl,--version-script=$(location @//third_party/angle:libEGL_angle.lds)",
+        ],
+    }) + selects.with_or({
         (
+            "@platforms//os:macos",
             "@//toolchain/bazel:asan_build",
             "@//toolchain/bazel:msan_build",
             "@//toolchain/bazel:ubsan_build",
@@ -2410,22 +2562,38 @@ cc_shared_library(
     }),
     deps = [
         ":libegl",
-    ],
+    ] + select({
+        "@platforms//os:macos": [
+            ":angle_apple",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 cc_shared_library(
     name = "libGLESv2",
-    additional_linker_inputs = [
-        "@//third_party/angle:libGLESv2_angle.lds",
-    ],
-    shared_lib_name = "libGLESv2.so",
-    user_link_flags = [
-        "-ldl",
-        "-Wl,--gc-sections",
-        "-Wl,-rpath=$$ORIGIN",
-        "-Wl,--version-script=$(location @//third_party/angle:libGLESv2_angle.lds)",
-    ] + selects.with_or({
+    additional_linker_inputs = select({
+        "@platforms//os:macos": [],
+        "//conditions:default": ["@//third_party/angle:libGLESv2_angle.lds"],
+    }),
+    shared_lib_name = select({
+        "@platforms//os:macos": "libGLESv2.dylib",
+        "//conditions:default": "libGLESv2.so",
+    }),
+    user_link_flags = select({
+        "@platforms//os:macos": [
+            "-Wl,-dead_strip",
+            "-Wl,-rpath,@loader_path",
+        ],
+        "//conditions:default": [
+            "-ldl",
+            "-Wl,--gc-sections",
+            "-Wl,-rpath=$$ORIGIN",
+            "-Wl,--version-script=$(location @//third_party/angle:libGLESv2_angle.lds)",
+        ],
+    }) + selects.with_or({
         (
+            "@platforms//os:macos",
             "@//toolchain/bazel:asan_build",
             "@//toolchain/bazel:msan_build",
             "@//toolchain/bazel:ubsan_build",
@@ -2436,5 +2604,10 @@ cc_shared_library(
     }),
     deps = [
         ":libglesv2",
-    ],
+    ] + select({
+        "@platforms//os:macos": [
+            ":angle_apple",
+        ],
+        "//conditions:default": [],
+    }),
 )

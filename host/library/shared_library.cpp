@@ -185,6 +185,25 @@ SharedLibrary* SharedLibrary::do_open(const char* libraryName,
             libraryName, libPath);
         lib = dlopen(libPath, RTLD_NOW);
     }
+    if (lib == NULL) {
+        // DYLD_LIBRARY_PATH is stripped from the environment in some contexts
+        // (e.g. macOS System Integrity Protection), so a bare dlopen can not find
+        // libraries there. Search LD_LIBRARY_PATH manually with full paths, which
+        // is not subject to that stripping.
+        const std::vector<std::string> libraryPaths =
+            gfxstream::Split(gfxstream::base::getEnvironmentVariable("LD_LIBRARY_PATH"), ":");
+        for (const std::string& libraryPath : libraryPaths) {
+            if (libraryPath.empty()) {
+                continue;
+            }
+            const std::string fullpath = PathUtils::join(libraryPath, libPath);
+            GFXSTREAM_VERBOSE("Calling dlopen on %s.", fullpath.c_str());
+            lib = dlopen(fullpath.c_str(), RTLD_NOW);
+            if (lib != nullptr) {
+                break;
+            }
+        }
+    }
 #else
     GFXSTREAM_VERBOSE("SharedLibrary::open for [%s] (posix,linux): call dlopen on [%s]", libraryName, libPath);
     void* lib = nullptr;

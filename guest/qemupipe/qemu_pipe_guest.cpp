@@ -24,7 +24,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__linux__)
 #include <linux/vm_sockets.h>
+#endif
 #include <qemu_pipe_bp.h>
 
 #ifdef GFXSTREAM_USE_COMMON_LOGGING
@@ -67,6 +69,13 @@ int open_verbose_path(const char* name, const int flags) {
 }
 
 int open_verbose_vsock(const VsockPort port, const int flags) {
+#if defined(__APPLE__)
+    // vsock (AF_VSOCK) is a Linux-only transport. It is not available on macOS,
+    // where callers fall back to other transports.
+    (void)port;
+    (void)flags;
+    return -EINVAL;
+#else
     const int fd = QEMU_PIPE_RETRY(socket(AF_VSOCK, SOCK_STREAM, 0));
     if (fd < 0) {
         // it is ok if socket(AF_VSOCK, ...) fails - vsock might be unsupported yet
@@ -111,6 +120,7 @@ int open_verbose_vsock(const VsockPort port, const int flags) {
     }
 
     return fd;
+#endif  // defined(__APPLE__)
 }
 
 int open_verbose(const char *pipeName, const int flags) {

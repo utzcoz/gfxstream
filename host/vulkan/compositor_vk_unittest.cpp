@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -339,11 +340,20 @@ class CompositorVkTest : public ::testing::Test {
             .engineVersion = VK_MAKE_VERSION(1, 0, 0),
             .apiVersion = VK_API_VERSION_1_1,
         };
+        std::vector<const char*> instanceExtensions;
+        VkInstanceCreateFlags instanceCreateFlags = 0;
+#if defined(__APPLE__)
+        // MoltenVK is a portability driver; the Vulkan loader only enumerates it
+        // when the portability enumeration extension and flag are set.
+        instanceExtensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        instanceCreateFlags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#endif
         const VkInstanceCreateInfo instanceCi = {
             .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            .flags = instanceCreateFlags,
             .pApplicationInfo = &appInfo,
-            .enabledExtensionCount = 0,
-            .ppEnabledExtensionNames = nullptr,
+            .enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size()),
+            .ppEnabledExtensionNames = instanceExtensions.data(),
         };
         ASSERT_NE(k_vk->vkCreateInstance, nullptr);
         ASSERT_EQ(k_vk->vkCreateInstance(&instanceCi, nullptr, &m_vkInstance), VK_SUCCESS);
@@ -385,6 +395,25 @@ class CompositorVkTest : public ::testing::Test {
         FAIL() << "Can't find a suitable VkPhysicalDevice.";
     }
 
+#if defined(__APPLE__)
+    bool deviceSupportsExtension(const char* extensionName) {
+        uint32_t extensionCount = 0;
+        if (k_vk->vkEnumerateDeviceExtensionProperties(m_vkPhysicalDevice, nullptr, &extensionCount,
+                                                       nullptr) != VK_SUCCESS) {
+            return false;
+        }
+        std::vector<VkExtensionProperties> extensions(extensionCount);
+        if (k_vk->vkEnumerateDeviceExtensionProperties(m_vkPhysicalDevice, nullptr, &extensionCount,
+                                                       extensions.data()) != VK_SUCCESS) {
+            return false;
+        }
+        return std::any_of(extensions.begin(), extensions.end(),
+                           [extensionName](const VkExtensionProperties& extension) {
+                               return strcmp(extension.extensionName, extensionName) == 0;
+                           });
+    }
+#endif
+
     void createLogicalDevice() {
         const float queuePriority = 1.0f;
         const VkDeviceQueueCreateInfo queueCi = {
@@ -397,14 +426,27 @@ class CompositorVkTest : public ::testing::Test {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
             .pNext = nullptr,
         };
+        std::vector<const char*> deviceExtensions;
+#if defined(__APPLE__)
+        // A portability driver such as MoltenVK only exposes the Vulkan
+        // portability subset, which must be enabled explicitly when creating the
+        // device. Requesting it on a driver that does not advertise it fails with
+        // VK_ERROR_EXTENSION_NOT_PRESENT, so only enable it when it is present.
+        // The extension name macro is gated behind VK_ENABLE_BETA_EXTENSIONS, so
+        // use the literal string.
+        static constexpr const char* kPortabilitySubset = "VK_KHR_portability_subset";
+        if (deviceSupportsExtension(kPortabilitySubset)) {
+            deviceExtensions.push_back(kPortabilitySubset);
+        }
+#endif
         const VkDeviceCreateInfo deviceCi = {
             .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .pNext = &features,
             .queueCreateInfoCount = 1,
             .pQueueCreateInfos = &queueCi,
             .enabledLayerCount = 0,
-            .enabledExtensionCount = 0,
-            .ppEnabledExtensionNames = nullptr,
+            .enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size()),
+            .ppEnabledExtensionNames = deviceExtensions.data(),
         };
         ASSERT_EQ(k_vk->vkCreateDevice(m_vkPhysicalDevice, &deviceCi, nullptr, &m_vkDevice),
                   VK_SUCCESS);

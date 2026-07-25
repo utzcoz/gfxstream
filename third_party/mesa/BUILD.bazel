@@ -3,5 +3,6 @@ package(
 )
 
 exports_files([
+    "macos_virtgpu_backend.cpp",
     "vk_lavapipe_icd.json",
 ])

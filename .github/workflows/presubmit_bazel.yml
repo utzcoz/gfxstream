@@ -13,16 +13,50 @@ on:
         type: string
         default: ''
 
+      # Which targets to build. Defaults to everything, but platforms that can
+      # not build the full target graph (e.g. macOS, which lacks the Linux-only
+      # mesa/libdrm/guest dependencies) can override this with a curated list.
+      build-targets:
+        type: string
+        default: '...'
+
+      # Which graphics drivers/test environment to use. Defaults to the ANGLE +
+      # SwiftShader environment. Platforms without a buildable SwiftShader (e.g.
+      # macOS) can override this with `host`.
+      graphics-drivers:
+        type: string
+        default: 'gles_angle_vulkan_swiftshader'
+
       # Whether or not to run the `bazel test` step:
       run-tests:
         type: boolean
         default: true
+
+      # Extra flags passed only to the `bazel test` step (e.g. --test_env for
+      # pointing the tests at a Vulkan driver). Not passed to `bazel build`.
+      test-bazel-args:
+        type: string
+        default: ''
+
+      # Which test targets to run when run-tests is true. Platforms that can only
+      # run a subset (e.g. macOS, which has no host Vulkan driver) can override
+      # this with a curated list.
+      test-targets:
+        type: string
+        default: >-
+          host:gfxstream_framebuffer_tests
+          host/vulkan:gfxstream_compositorvk_tests
+          host/vulkan:gfxstream_emulatedphysicalmemory_tests
+          host/vulkan:vk_common_operations_tests
+          host/vulkan:vk_format_utils_tests
+          tests/end2end:gfxstream_end2end_tests
 
 jobs:
   presubmit_bazel_workflow:
     runs-on: ${{ inputs.runner }}
     steps:
     - name: Free disk space
+      if: runner.os == 'Linux'
       uses: jlumbroso/free-disk-space@v1.3.1
       with:
         tool-cache: true
@@ -31,13 +65,24 @@ jobs:
       uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
 
     - name: Install bazel
+      if: runner.os == 'Linux'
       run: sudo bash toolchain/bazel/install_bazel.sh
 
-    - name: Install toolchain dependencies
+    - name: Install toolchain dependencies (Linux)
+      if: runner.os == 'Linux'
       run: sudo bash toolchain/bazel/install_toolchain_dependencies.sh
 
-    - name: Install runtime dependencies
+    - name: Install runtime dependencies (Linux)
+      if: runner.os == 'Linux'
       run: sudo apt-get install -y libvulkan1
+
+    - name: Install dependencies (macOS)
+      if: runner.os == 'macOS'
+      # molten-vk provides a Vulkan-on-Metal driver and vulkan-loader provides
+      # libvulkan, which together give the host-driver tests a Vulkan
+      # implementation to run against. How much of it works depends on the Metal
+      # support the runner exposes.
+      run: brew install bazelisk molten-vk vulkan-loader
 
     - name: Load cache config
       run: cat .config/cache-config.env >> $GITHUB_ENV
@@ -54,24 +99,25 @@ jobs:
 
     - name: Build
       run: |
-        bazel build ... \
+        bazel build ${{ inputs.build-targets }} \
           --disk_cache=$HOME/bazel-disk-cache \
-          --graphics_drivers=gles_angle_vulkan_swiftshader \
+          --graphics_drivers=${{ inputs.graphics-drivers }} \
           --verbose_failures \
           ${{ inputs.additional-bazel-args }}
 
     - name: Test
       if: ${{ inputs.run-tests }}
       run: |
+        # The inputs below are deliberately unquoted so that the shell splits
+        # them into separate arguments. Disable globbing so that a value such as
+        # --test_arg=--gtest_filter=*Foo* is passed through literally rather than
+        # being expanded against the files in the workspace.
+        set -f
         bazel test \
           --disk_cache=$HOME/bazel-disk-cache \
-          --graphics_drivers=gles_angle_vulkan_swiftshader \
+          --graphics_drivers=${{ inputs.graphics-drivers }} \
           --test_output=streamed \
           --verbose_failures \
-          host:gfxstream_framebuffer_tests \
-          host/vulkan:gfxstream_compositorvk_tests \
-          host/vulkan:gfxstream_emulatedphysicalmemory_tests \
-          host/vulkan:vk_common_operations_tests \
-          host/vulkan:vk_format_utils_tests \
-          tests/end2end:gfxstream_end2end_tests \
+          ${{ inputs.test-targets }} \
+          ${{ inputs.test-bazel-args }} \
           ${{ inputs.additional-bazel-args }}

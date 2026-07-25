@@ -17,6 +17,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
 namespace gfxstream {
 namespace guest {
 
@@ -27,6 +31,17 @@ std::string getProgramDirectory() {
     memset(path, 0, sizeof(path));  // happy valgrind!
     int len = readlink("/proc/self/exe", path, sizeof(path));
     if (len > 0 && len < (int)sizeof(path)) {
+        char* x = ::strrchr(path, '/');
+        if (x) {
+            *x = '\0';
+            res.assign(path);
+        }
+    }
+#elif defined(__APPLE__)
+    char path[1024];
+    memset(path, 0, sizeof(path));
+    uint32_t size = sizeof(path);
+    if (_NSGetExecutablePath(path, &size) == 0) {
         char* x = ::strrchr(path, '/');
         if (x) {
             *x = '\0';
