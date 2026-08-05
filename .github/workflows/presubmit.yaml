@@ -79,10 +79,43 @@ jobs:
         //host:gfxstream_backend_static
         //host:gfxstream_backend_shared
         //host:gfxstream_backend
-      # Nothing is run yet: this job exists to keep the macOS host build
-      # compiling. Tests need a graphics driver environment that macOS does not
-      # have here yet.
-      run-tests: false
+      # Use the default host driver environment: SwiftShader can not be built on
+      # macOS. Vulkan-backed tests instead run against MoltenVK (installed via
+      # brew), pointed at by the ANDROID_EMU_VK_LOADER_PATH / VK_*_FILES env
+      # vars below.
+      graphics-drivers: host
+      run-tests: true
+      # The GLES framebuffer test needs the ANGLE GLES driver and runs in a
+      # separate job below, as do the end2end tests (which additionally need the
+      # mesa guest driver and the kumquat server built on top of it).
+      test-targets: >-
+        //host:gfxstream_vsyncthread_tests
+        //host/vulkan:vk_format_utils_tests
+        //host/vulkan:gfxstream_emulatedphysicalmemory_tests
+        //host/vulkan:gfxstream_emulatedphysicalqueue_tests
+        //host/vulkan:vk_common_operations_tests
+        //host/vulkan:gfxstream_displayvk_tests
+        //host/vulkan:gfxstream_compositorvk_tests
+      test-bazel-args: >-
+        --test_env=ANDROID_EMU_VK_LOADER_PATH=/opt/homebrew/lib/libvulkan.dylib
+        --test_env=VK_DRIVER_FILES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
+        --test_env=VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
+
+  # GLES tests use ANGLE (built on macOS) for the EGL/GLES driver, running on top
+  # of MoltenVK for Vulkan. This uses the gles_angle_vulkan_moltenvk test
+  # environment, which stages the ANGLE libraries and the system Vulkan loader
+  # together and points them at MoltenVK.
+  run-gfxstream-bazel-gles-build-macos:
+    uses: ./.github/workflows/presubmit_bazel.yml
+    with:
+      runner: macos-26
+      build-targets: //host:gfxstream_framebuffer_tests
+      graphics-drivers: gles_angle_vulkan_moltenvk
+      run-tests: true
+      test-targets: //host:gfxstream_framebuffer_tests
+      test-bazel-args: >-
+        --test_env=GFXSTREAM_TESTING_VULKAN_LOADER=/opt/homebrew/lib/libvulkan.1.dylib
+        --test_env=GFXSTREAM_TESTING_VULKAN_ICD=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
 
   run-gfxstream-cmake-build:
     runs-on: ubuntu-22.04
