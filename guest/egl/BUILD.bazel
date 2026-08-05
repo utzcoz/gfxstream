@@ -42,10 +42,15 @@ cc_library(
         "//third_party/android:gfxstream_thirdparty_android_headers",
         "//third_party/opengl:gfxstream_gles3_headers",
         "//third_party/opengl:gfxstream_gles_headers",
-        "@drm//:libdrm",
         "@mesa//:mesa_gfxstream_guest_android",
         "@mesa//:mesa_gfxstream_guest_platform",
-    ],
+    ] + select({
+        # macOS uses the kumquat backend, which does not need libdrm.
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+            "@drm//:libdrm",
+        ],
+    }),
 )
 
 cc_shared_library(
