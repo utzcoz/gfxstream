@@ -81,6 +81,7 @@ rutabaga_crate_deps.spec(
         "net",
         "param",
         "pipe",
+        "shm",
         "thread",
         "use-libc",
         "use-libc-auxv",

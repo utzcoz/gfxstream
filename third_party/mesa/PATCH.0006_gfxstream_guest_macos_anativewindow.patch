@@ -1,0 +1,260 @@
+From fbee202ad83c7e1b5307b94b4793b33baca87192 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sun, 26 Jul 2026 11:37:24 +0800
+Subject: [PATCH 6/8] gfxstream/guest: declare the EGLClientBuffer overloads
+ only where distinct
+
+ANativeWindowHelper overloads isValid(), acquire(), release(), getWidth()
+and getHeight() on EGLNativeWindowType and EGLClientBuffer. EGLClientBuffer
+is a plain void*, and so is EGLNativeWindowType on Apple platforms, so there
+the two overloads of each declare the same function.
+
+Name that condition once as GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS and
+guard the affected declarations and definitions with it.
+---
+ .../guest/android/ANativeWindowAndroid.cpp      |  8 ++++++--
+ .../guest/android/ANativeWindowAndroid.h        |  6 ++++++
+ .../guest/android/ANativeWindowEmulated.cpp     |  8 ++++++--
+ .../guest/android/ANativeWindowEmulated.h       |  6 ++++++
+ .../include/gfxstream/guest/ANativeWindow.h     | 17 +++++++++++++++++
+ 5 files changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/src/gfxstream/guest/android/ANativeWindowAndroid.cpp b/src/gfxstream/guest/android/ANativeWindowAndroid.cpp
+index 5131c4e..2030a32 100644
+--- a/src/gfxstream/guest/android/ANativeWindowAndroid.cpp
++++ b/src/gfxstream/guest/android/ANativeWindowAndroid.cpp
+@@ -23,6 +23,7 @@ bool ANativeWindowHelperAndroid::isValid(EGLNativeWindowType window) {
+ #endif  // DETECT_OS_ANDROID
+ }
+ 
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+ bool ANativeWindowHelperAndroid::isValid(EGLClientBuffer buffer) {
+ #if DETECT_OS_ANDROID
+     auto* anwb = reinterpret_cast<ANativeWindowBuffer*>(buffer);
+@@ -41,6 +42,7 @@ bool ANativeWindowHelperAndroid::isValid(EGLClientBuffer buffer) {
+     return false;
+ #endif  // DETECT_OS_ANDROID
+ }
++#endif
+ 
+ void ANativeWindowHelperAndroid::acquire(EGLNativeWindowType window) {
+ #if DETECT_OS_ANDROID
+@@ -60,6 +62,7 @@ void ANativeWindowHelperAndroid::release(EGLNativeWindowType window) {
+ #endif  // DETECT_OS_ANDROID
+ }
+ 
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+ void ANativeWindowHelperAndroid::acquire(EGLClientBuffer buffer) {
+ #if DETECT_OS_ANDROID
+     auto* anwb = reinterpret_cast<ANativeWindowBuffer*>(buffer);
+@@ -68,7 +71,7 @@ void ANativeWindowHelperAndroid::acquire(EGLClientBuffer buffer) {
+     (void)buffer;
+ #endif  // DETECT_OS_ANDROID
+ }
+ 
+ void ANativeWindowHelperAndroid::release(EGLClientBuffer buffer) {
+ #if DETECT_OS_ANDROID
+     auto* anwb = reinterpret_cast<ANativeWindowBuffer*>(buffer);
+@@ -77,6 +79,7 @@ void ANativeWindowHelperAndroid::release(EGLClientBuffer buffer) {
+     (void)buffer;
+ #endif  // DETECT_OS_ANDROID
+ }
++#endif
+ 
+ int ANativeWindowHelperAndroid::getConsumerUsage(EGLNativeWindowType window, int* usage) {
+ #if DETECT_OS_ANDROID
+@@ -119,6 +122,7 @@ int ANativeWindowHelperAndroid::getHeight(EGLNativeWindowType window) {
+ #endif  // DETECT_OS_ANDROID
+ }
+ 
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+ int ANativeWindowHelperAndroid::getWidth(EGLClientBuffer buffer) {
+ #if DETECT_OS_ANDROID
+     auto* anwb = reinterpret_cast<ANativeWindowBuffer*>(buffer);
+@@ -128,7 +132,7 @@ int ANativeWindowHelperAndroid::getWidth(EGLClientBuffer buffer) {
+     return -1;
+ #endif  // DETECT_OS_ANDROID
+ }
+ 
+ int ANativeWindowHelperAndroid::getHeight(EGLClientBuffer buffer) {
+ #if DETECT_OS_ANDROID
+     auto* anwb = reinterpret_cast<ANativeWindowBuffer*>(buffer);
+@@ -138,6 +141,7 @@ int ANativeWindowHelperAndroid::getHeight(EGLClientBuffer buffer) {
+     return -1;
+ #endif  // DETECT_OS_ANDROID
+ }
++#endif
+ 
+ int ANativeWindowHelperAndroid::getFormat(EGLClientBuffer buffer, Gralloc* gralloc) {
+ #if DETECT_OS_ANDROID
+diff --git a/src/gfxstream/guest/android/ANativeWindowAndroid.h b/src/gfxstream/guest/android/ANativeWindowAndroid.h
+index 0f421fc..73c1c75 100644
+--- a/src/gfxstream/guest/android/ANativeWindowAndroid.h
++++ b/src/gfxstream/guest/android/ANativeWindowAndroid.h
+@@ -17,13 +17,17 @@ class ANativeWindowHelperAndroid : public ANativeWindowHelper {
+     ANativeWindowHelperAndroid() = default;
+ 
+     bool isValid(EGLNativeWindowType window);
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+     bool isValid(EGLClientBuffer buffer);
++#endif
+ 
+     void acquire(EGLNativeWindowType window);
+     void release(EGLNativeWindowType window);
+ 
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+     void acquire(EGLClientBuffer buffer);
+     void release(EGLClientBuffer buffer);
++#endif
+ 
+     int getConsumerUsage(EGLNativeWindowType window, int* usage);
+     void setUsage(EGLNativeWindowType window, int usage);
+@@ -31,8 +35,10 @@ class ANativeWindowHelperAndroid : public ANativeWindowHelper {
+     int getWidth(EGLNativeWindowType window);
+     int getHeight(EGLNativeWindowType window);
+ 
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+     int getWidth(EGLClientBuffer buffer);
+     int getHeight(EGLClientBuffer buffer);
++#endif
+ 
+     int getFormat(EGLClientBuffer buffer, Gralloc* helper);
+ 
+diff --git a/src/gfxstream/guest/android/ANativeWindowEmulated.cpp b/src/gfxstream/guest/android/ANativeWindowEmulated.cpp
+index ae16ce7..fc562c3 100644
+--- a/src/gfxstream/guest/android/ANativeWindowEmulated.cpp
++++ b/src/gfxstream/guest/android/ANativeWindowEmulated.cpp
+@@ -77,11 +77,13 @@ bool EmulatedANativeWindowHelper::isValid(EGLNativeWindowType window) {
+     return true;
+ }
+ 
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+ bool EmulatedANativeWindowHelper::isValid(EGLClientBuffer buffer) {
+     // TODO: maybe a registry of valid EmulatedAHardwareBuffer-s?
+     (void)buffer;
+     return true;
+ }
++#endif
+ 
+ void EmulatedANativeWindowHelper::acquire(EGLNativeWindowType window) {
+     auto* anw = reinterpret_cast<EmulatedANativeWindow*>(window);
+@@ -93,12 +95,14 @@ void EmulatedANativeWindowHelper::release(EGLNativeWindowType window) {
+     anw->release();
+ }
+ 
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+ void EmulatedANativeWindowHelper::acquire(EGLClientBuffer buffer) {
+     // TODO: maybe a registry of valid EmulatedAHardwareBuffer-s?
+     (void)buffer;
+ }
+ 
+ void EmulatedANativeWindowHelper::release(EGLClientBuffer buffer) { (void)buffer; }
++#endif
+ 
+ int EmulatedANativeWindowHelper::getConsumerUsage(EGLNativeWindowType window, int* usage) {
+     (void)window;
+@@ -120,15 +123,17 @@ int EmulatedANativeWindowHelper::getHeight(EGLNativeWindowType window) {
+     return anw->getHeight();
+ }
+ 
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+ int EmulatedANativeWindowHelper::getWidth(EGLClientBuffer buffer) {
+     auto ahb = reinterpret_cast<EmulatedAHardwareBuffer*>(buffer);
+     return ahb->getWidth();
+ }
+ 
+ int EmulatedANativeWindowHelper::getHeight(EGLClientBuffer buffer) {
+     auto ahb = reinterpret_cast<EmulatedAHardwareBuffer*>(buffer);
+     return ahb->getHeight();
+ }
++#endif
+ 
+ int EmulatedANativeWindowHelper::getFormat(EGLClientBuffer buffer, Gralloc* helper) {
+     (void)helper;
+diff --git a/src/gfxstream/guest/android/ANativeWindowEmulated.h b/src/gfxstream/guest/android/ANativeWindowEmulated.h
+index 79076e3..5875a84 100644
+--- a/src/gfxstream/guest/android/ANativeWindowEmulated.h
++++ b/src/gfxstream/guest/android/ANativeWindowEmulated.h
+@@ -52,13 +52,17 @@ class EmulatedANativeWindow {
+ class EmulatedANativeWindowHelper : public ANativeWindowHelper {
+    public:
+     bool isValid(EGLNativeWindowType window) override;
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+     bool isValid(EGLClientBuffer buffer) override;
++#endif
+ 
+     void acquire(EGLNativeWindowType window) override;
+     void release(EGLNativeWindowType window) override;
+ 
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+     void acquire(EGLClientBuffer buffer) override;
+     void release(EGLClientBuffer buffer) override;
++#endif
+ 
+     int getConsumerUsage(EGLNativeWindowType window, int* usage) override;
+     void setUsage(EGLNativeWindowType window, int usage) override;
+@@ -66,8 +70,10 @@ class EmulatedANativeWindowHelper : public ANativeWindowHelper {
+     int getWidth(EGLNativeWindowType window) override;
+     int getHeight(EGLNativeWindowType window) override;
+ 
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+     int getWidth(EGLClientBuffer buffer) override;
+     int getHeight(EGLClientBuffer buffer) override;
++#endif
+ 
+     int getFormat(EGLClientBuffer buffer, Gralloc* helper) override;
+ 
+diff --git a/src/gfxstream/guest/android/include/gfxstream/guest/ANativeWindow.h b/src/gfxstream/guest/android/include/gfxstream/guest/ANativeWindow.h
+index af0a65c..99a438e 100644
+--- a/src/gfxstream/guest/android/include/gfxstream/guest/ANativeWindow.h
++++ b/src/gfxstream/guest/android/include/gfxstream/guest/ANativeWindow.h
+@@ -11,9 +11,20 @@
+ #include <EGL/eglext.h>
+ 
+ #include "GfxStreamGralloc.h"
++#include "util/detect_os.h"
+ 
+ using EGLClientBuffer = void*;
+ 
++// EGLNativeWindowType is also a plain `void*` on Apple platforms, which makes it
++// indistinguishable from EGLClientBuffer. The EGLClientBuffer overloads below
++// would then redeclare the EGLNativeWindowType ones, so they exist only where the
++// two types are actually distinct.
++#if DETECT_OS_APPLE
++#define GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS 0
++#else
++#define GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS 1
++#endif
++
+ namespace gfxstream {
+ 
+ // Abstraction around libnativewindow to support testing.
+@@ -22,13 +33,17 @@ class ANativeWindowHelper {
+     virtual ~ANativeWindowHelper() {}
+ 
+     virtual bool isValid(EGLNativeWindowType window) = 0;
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+     virtual bool isValid(EGLClientBuffer buffer) = 0;
++#endif
+ 
+     virtual void acquire(EGLNativeWindowType window) = 0;
+     virtual void release(EGLNativeWindowType window) = 0;
+ 
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+     virtual void acquire(EGLClientBuffer buffer) = 0;
+     virtual void release(EGLClientBuffer buffer) = 0;
++#endif
+ 
+     virtual int getConsumerUsage(EGLNativeWindowType window, int* usage) = 0;
+     virtual void setUsage(EGLNativeWindowType window, int usage) = 0;
+@@ -36,8 +51,10 @@ class ANativeWindowHelper {
+     virtual int getWidth(EGLNativeWindowType window) = 0;
+     virtual int getHeight(EGLNativeWindowType window) = 0;
+ 
++#if GFXSTREAM_ANW_HAS_CLIENT_BUFFER_OVERLOADS
+     virtual int getWidth(EGLClientBuffer buffer) = 0;
+     virtual int getHeight(EGLClientBuffer buffer) = 0;
++#endif
+     virtual int getFormat(EGLClientBuffer buffer, Gralloc* helper) = 0;
+     virtual int getHostHandle(EGLClientBuffer buffer, Gralloc* helper) = 0;
+ 

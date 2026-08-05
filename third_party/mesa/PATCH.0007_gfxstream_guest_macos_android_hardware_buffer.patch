@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sat, 25 Jul 2026 13:18:13 +0800
+Subject: [PATCH 7/8] gfxstream/guest: use the DRM fourcc codes on Apple
+
+AndroidHardwareBuffer.cpp needs the DRM fourcc codes to describe buffer
+formats and includes them for Android and Linux only, so it does not compile
+on Apple. The codes are plain constants and apply as they are.
+
+This file is only built for Android and emulated Android, so it is not part of
+what goes upstream for a plain macOS build.
+---
+ src/gfxstream/guest/vulkan_enc/AndroidHardwareBuffer.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/gfxstream/guest/vulkan_enc/AndroidHardwareBuffer.cpp b/src/gfxstream/guest/vulkan_enc/AndroidHardwareBuffer.cpp
+index 8450fbe..f7f49ff 100644
+--- a/src/gfxstream/guest/vulkan_enc/AndroidHardwareBuffer.cpp
++++ b/src/gfxstream/guest/vulkan_enc/AndroidHardwareBuffer.cpp
+@@ -5,7 +5,7 @@
+ #include "AndroidHardwareBuffer.h"
+ #include "util/detect_os.h"
+ 
+-#if DETECT_OS_ANDROID || DETECT_OS_LINUX
++#if DETECT_OS_ANDROID || DETECT_OS_LINUX || DETECT_OS_APPLE
+ #include <drm_fourcc.h>
+ #define DRM_FORMAT_YVU420_ANDROID fourcc_code('9', '9', '9', '7')
+ #define DRM_FORMAT_D16_UNORM fourcc_code('9', '9', '9', '6')

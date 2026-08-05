@@ -1,0 +1,32 @@
+From a36671a0f2c93c08df2e65f8bb538de70e286336 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Sun, 26 Jul 2026 11:37:24 +0800
+Subject: [PATCH 2/8] gfxstream/guest: import host memory through an fd on Apple
+ too
+
+GfxStreamVulkanMapper imports host memory through a file descriptor and is
+compiled for Linux only, so the kumquat guest platform does not build on Apple.
+The import path applies as it is; nothing about it is Linux specific.
+
+It is not known to work there yet: kumquat never produces a dma-buf handle on
+Apple, and the remaining opaque-fd path needs VK_KHR_external_memory_fd, which
+MoltenVK does not implement. This only makes it build.
+---
+ .../kumquat/vulkan-mapper/GfxStreamVulkanMapper.cpp         | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/gfxstream/guest/platform/kumquat/vulkan-mapper/GfxStreamVulkanMapper.cpp b/src/gfxstream/guest/platform/kumquat/vulkan-mapper/GfxStreamVulkanMapper.cpp
+index 5287d199491..d39139e0b6e 100644
+--- a/src/gfxstream/guest/platform/kumquat/vulkan-mapper/GfxStreamVulkanMapper.cpp
++++ b/src/gfxstream/guest/platform/kumquat/vulkan-mapper/GfxStreamVulkanMapper.cpp
+@@ -257,7 +257,9 @@ int32_t GfxStreamVulkanMapper::map(struct VulkanMapperData* mapData) {
+         L"",
+     };
+ 
+-#elif DETECT_OS_LINUX
++// Builds on Apple, but is not known to work there: MoltenVK does not implement
++// VK_KHR_external_memory_fd.
++#elif DETECT_OS_LINUX || DETECT_OS_APPLE
+     VkExternalMemoryHandleTypeFlagBits flagBits;
+     if (mapData->handleType == VIRTGPU_KUMQUAT_HANDLE_TYPE_MEM_DMABUF) {
+         flagBits = (enum VkExternalMemoryHandleTypeFlagBits)(uint32_t(VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT));

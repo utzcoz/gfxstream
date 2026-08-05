@@ -1,0 +1,1133 @@
+From aafd52daa1c7bb8d8df806cccbd94c91cb461cb5 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Fri, 7 Aug 2026 21:26:16 +0800
+Subject: [PATCH 8/8] util/rust: implement the sys layer for macOS
+
+mesa3d_util supported Linux and Windows; macOS resolved to the stub backend,
+whose entry points are unimplemented. Implement it, so that the guest driver
+and the kumquat transport built on top of it work on macOS.
+
+The primitives macOS lacks are emulated with the closest equivalent:
+
+- No AF_UNIX SOCK_SEQPACKET, so packet tubes are framed over SOCK_STREAM with
+  an 8-byte [payload length][descriptor count] header. The descriptors ride on
+  the header via SCM_RIGHTS, and a message is reassembled with as many recvmsg
+  calls as it takes. receive() checks the descriptor count it was promised
+  against the one it got.
+- No MSG_NOSIGNAL, so tube sockets carry SO_NOSIGPIPE: writing to a closed peer
+  yields EPIPE rather than killing a host process that has not reset SIGPIPE.
+- Accepted sockets inherit the listener's file status flags on BSD-derived
+  systems, unlike Linux. The listener is non-blocking so that accepting never
+  stalls an event loop, so accept() clears O_NONBLOCK again: the calls that
+  reassemble the rest of a message must wait for it rather than fail with
+  EAGAIN.
+- No eventfd. An event has to be a single descriptor that can be both signalled
+  and waited on, and that keeps working once duplicated into another process,
+  because either side may be the one to signal. A self-connected AF_UNIX
+  SOCK_DGRAM socket has that property; pipe() and socketpair() do not, because
+  they produce two descriptors where MesaHandle carries one. The socket is
+  non-blocking and both signal and wait go through kqueue, waiting for
+  EVFILT_WRITE or EVFILT_READ before touching it, so a signal cannot stall on a
+  full buffer and a wait can grow a timeout later.
+- No memfd_create, so anonymous shared memory is shm_open followed immediately
+  by shm_unlink.
+- No epoll, so the wait context is built on kqueue.
+- No /proc/self/fd, so descriptors are classified from their stat file type and
+  open flags rather than from a symlink target.
+
+The atomic memory sentinel is left to the stub. It backs a cross-domain use
+case that only exists on X11 and Wayland, so macOS has nothing to implement.
+
+Everything goes through rustix, which mesa3d_util already depends on, so this
+adds no new crate dependency and needs no build changes.
+---
+ src/util/rust/error.rs                    |   2 +-
+ src/util/rust/sys/macos/descriptor.rs     | 166 +++++++++++++
+ src/util/rust/sys/macos/event.rs          | 226 ++++++++++++++++++
+ src/util/rust/sys/macos/memory_mapping.rs |  93 ++++++++
+ src/util/rust/sys/macos/mod.rs            |  19 ++
+ src/util/rust/sys/macos/pipe.rs           |  74 ++++++
+ src/util/rust/sys/macos/shm.rs            |  72 ++++++
+ src/util/rust/sys/macos/tube.rs           | 274 ++++++++++++++++++++++
+ src/util/rust/sys/macos/wait_context.rs   |  84 +++++++
+ src/util/rust/sys/mod.rs                  |   9 +-
+ 10 files changed, 1016 insertions(+), 3 deletions(-)
+ create mode 100644 src/util/rust/sys/macos/descriptor.rs
+ create mode 100644 src/util/rust/sys/macos/event.rs
+ create mode 100644 src/util/rust/sys/macos/memory_mapping.rs
+ create mode 100644 src/util/rust/sys/macos/mod.rs
+ create mode 100644 src/util/rust/sys/macos/pipe.rs
+ create mode 100644 src/util/rust/sys/macos/shm.rs
+ create mode 100644 src/util/rust/sys/macos/tube.rs
+ create mode 100644 src/util/rust/sys/macos/wait_context.rs
+
+diff --git a/src/util/rust/error.rs b/src/util/rust/error.rs
+index 6792a41..32e8201 100644
+--- a/src/util/rust/error.rs
++++ b/src/util/rust/error.rs
+@@ -44,7 +44,7 @@ pub enum MesaError {
+     WithContext(&'static str),
+ }
+ 
+-#[cfg(any(target_os = "android", target_os = "linux"))]
++#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+ impl From<RustixError> for MesaError {
+     fn from(e: RustixError) -> MesaError {
+         MesaError::RustixError(e)
+diff --git a/src/util/rust/sys/macos/descriptor.rs b/src/util/rust/sys/macos/descriptor.rs
+new file mode 100644
+index 0000000..8206d76
+--- /dev/null
++++ b/src/util/rust/sys/macos/descriptor.rs
+@@ -0,0 +1,164 @@
++// Copyright 2026 Mesa3D authors
++// SPDX-License-Identifier: MIT
++
++use std::fs::File;
++use std::io::Error;
++use std::io::ErrorKind;
++use std::io::Result;
++use std::os::fd::AsFd;
++use std::os::fd::BorrowedFd;
++use std::os::fd::OwnedFd;
++use std::os::unix::io::AsRawFd;
++use std::os::unix::io::FromRawFd;
++use std::os::unix::io::IntoRawFd;
++use std::os::unix::io::RawFd;
++
++use rustix::fs::fcntl_getfl;
++use rustix::fs::fstat;
++use rustix::fs::seek;
++use rustix::fs::FileType;
++use rustix::fs::OFlags;
++use rustix::fs::SeekFrom;
++use rustix::net::sockopt::socket_type;
++use rustix::net::SocketType;
++
++use crate::descriptor::AsRawDescriptor;
++use crate::descriptor::FromRawDescriptor;
++use crate::descriptor::IntoRawDescriptor;
++use crate::DescriptorType;
++use crate::MESA_HANDLE_TYPE_MEM_SHM;
++use crate::MESA_MAP_ACCESS_READ;
++use crate::MESA_MAP_ACCESS_RW;
++use crate::MESA_MAP_ACCESS_WRITE;
++
++pub type RawDescriptor = RawFd;
++pub const DEFAULT_RAW_DESCRIPTOR: RawDescriptor = -1;
++
++#[derive(Debug)]
++pub struct OwnedDescriptor {
++    owned: OwnedFd,
++}
++
++impl OwnedDescriptor {
++    pub fn try_clone(&self) -> Result<OwnedDescriptor> {
++        let clone = self.owned.try_clone()?;
++        Ok(OwnedDescriptor { owned: clone })
++    }
++
++    pub fn determine_type(&self) -> Result<DescriptorType> {
++        // macOS has no /proc/self/fd, so classify descriptors from their stat
++        // file type and open flags rather than the symlink target.
++        if let Ok(fd_stat) = fstat(&self.owned) {
++            match FileType::from_raw_mode(fd_stat.st_mode) {
++                FileType::Socket => {
++                    // Events are SOCK_DGRAM (see event.rs) and tubes are
++                    // SOCK_STREAM, so the socket type tells them apart.
++                    let ty = socket_type(&self.owned)?;
++                    if ty == SocketType::DGRAM {
++                        return Ok(DescriptorType::Event);
++                    }
++                    return Ok(DescriptorType::Socket(ty.try_into()?));
++                }
++                FileType::Fifo => {
++                    // Only the writable end of a pipe has a type of its own, as
++                    // on Linux; the readable end is reported as unsupported.
++                    let flags = fcntl_getfl(&self.owned)?;
++                    if (flags & OFlags::ACCMODE) == OFlags::WRONLY {
++                        return Ok(DescriptorType::WritePipe);
++                    }
++                }
++                _ => {}
++            }
++        }
++
++        match seek(&self.owned, SeekFrom::End(0)) {
++            Ok(seek_size) => {
++                let size: u32 = seek_size
++                    .try_into()
++                    .map_err(|_| Error::from(ErrorKind::Unsupported))?;
++                Ok(DescriptorType::Memory(size, MESA_HANDLE_TYPE_MEM_SHM))
++            }
++            _ => {
++                let flags = fcntl_getfl(&self.owned)?;
++                match flags & OFlags::ACCMODE {
++                    OFlags::WRONLY => Ok(DescriptorType::WritePipe),
++                    _ => Err(Error::from(ErrorKind::Unsupported)),
++                }
++            }
++        }
++    }
++
++    pub fn determine_map_access_mode(&self) -> Result<u32> {
++        let flags = fcntl_getfl(&self.owned)?;
++        // macOS has no file seals, so access is determined solely by open flags.
++        let access = match flags & OFlags::ACCMODE {
++            OFlags::RDONLY => MESA_MAP_ACCESS_READ,
++            OFlags::WRONLY => MESA_MAP_ACCESS_WRITE,
++            OFlags::RDWR => MESA_MAP_ACCESS_RW,
++            _ => return Err(Error::from(ErrorKind::Unsupported)),
++        };
++        Ok(access)
++    }
++}
++
++impl AsRawDescriptor for OwnedDescriptor {
++    fn as_raw_descriptor(&self) -> RawDescriptor {
++        self.owned.as_raw_fd()
++    }
++}
++
++impl FromRawDescriptor for OwnedDescriptor {
++    // SAFETY:
++    // It is caller's responsibility to ensure that the descriptor is valid and
++    // stays valid for the lifetime of Self
++    unsafe fn from_raw_descriptor(descriptor: RawDescriptor) -> Self {
++        OwnedDescriptor {
++            owned: OwnedFd::from_raw_fd(descriptor),
++        }
++    }
++}
++
++impl IntoRawDescriptor for OwnedDescriptor {
++    fn into_raw_descriptor(self) -> RawDescriptor {
++        self.owned.into_raw_fd()
++    }
++}
++
++impl AsFd for OwnedDescriptor {
++    fn as_fd(&self) -> BorrowedFd<'_> {
++        self.owned.as_fd()
++    }
++}
++
++impl AsRawDescriptor for File {
++    fn as_raw_descriptor(&self) -> RawDescriptor {
++        self.as_raw_fd()
++    }
++}
++
++impl FromRawDescriptor for File {
++    // SAFETY:
++    // It is caller's responsibility to ensure that the descriptor is valid and
++    // stays valid for the lifetime of Self
++    unsafe fn from_raw_descriptor(descriptor: RawDescriptor) -> Self {
++        File::from_raw_fd(descriptor)
++    }
++}
++
++impl IntoRawDescriptor for File {
++    fn into_raw_descriptor(self) -> RawDescriptor {
++        self.into_raw_fd()
++    }
++}
++
++impl From<File> for OwnedDescriptor {
++    fn from(f: File) -> OwnedDescriptor {
++        OwnedDescriptor { owned: f.into() }
++    }
++}
++
++impl From<OwnedFd> for OwnedDescriptor {
++    fn from(o: OwnedFd) -> OwnedDescriptor {
++        OwnedDescriptor { owned: o }
++    }
++}
+diff --git a/src/util/rust/sys/macos/event.rs b/src/util/rust/sys/macos/event.rs
+new file mode 100644
+index 0000000..ffffa45
+--- /dev/null
++++ b/src/util/rust/sys/macos/event.rs
+@@ -0,0 +1,213 @@
++// Copyright 2026 Mesa3D authors
++// SPDX-License-Identifier: MIT
++
++use std::os::fd::OwnedFd;
++use std::path::Path;
++use std::path::PathBuf;
++use std::sync::atomic::AtomicU32;
++use std::sync::atomic::Ordering;
++
++use rustix::event::kqueue::kevent;
++use rustix::event::kqueue::kqueue;
++use rustix::event::kqueue::Event as KEvent;
++use rustix::event::kqueue::EventFilter;
++use rustix::event::kqueue::EventFlags;
++use rustix::fs::fcntl_getfl;
++use rustix::fs::fcntl_setfl;
++use rustix::fs::mkdir;
++use rustix::fs::rmdir;
++use rustix::fs::unlink;
++use rustix::fs::Mode;
++use rustix::fs::OFlags;
++use rustix::io::read;
++use rustix::io::write;
++use std::mem::MaybeUninit;
++use std::ptr::null_mut;
++use rustix::io::Errno;
++use rustix::net::bind;
++use rustix::net::connect;
++use rustix::net::socket_with;
++use rustix::net::AddressFamily;
++use rustix::net::SocketAddrUnix;
++use rustix::net::SocketFlags;
++use rustix::net::SocketType;
++
++use crate::AsBorrowedDescriptor;
++use crate::AsRawDescriptor;
++use crate::MesaError;
++use crate::MesaHandle;
++use crate::MesaResult;
++use crate::OwnedDescriptor;
++use crate::MESA_HANDLE_TYPE_SIGNAL_EVENT_FD;
++
++// macOS has no eventfd. An event has to be a single descriptor that can be both
++// signalled and waited on, and that keeps working once duplicated into another
++// process, because either side may be the one to signal.
++//
++// A self-connected AF_UNIX SOCK_DGRAM socket has that property: a datagram
++// written through any duplicate lands in the socket's own receive queue and can
++// be read back through any other. pipe() and socketpair() do not, because they
++// give two descriptors where MesaHandle carries one.
++
++static EVENT_COUNTER: AtomicU32 = AtomicU32::new(0);
++
++const MAX_DIRECTORY_ATTEMPTS: u32 = 64;
++
++pub struct Event {
++    descriptor: OwnedDescriptor,
++}
++
++/// Creates a mode 0700 directory to hold one event socket.
++///
++/// The socket has to be bound to a path before it can connect to itself, and
++/// binding straight into the shared temporary directory leaves a window in which
++/// another process could take the name. `mkdir()` is atomic, so bind inside a
++/// fresh directory instead. A name is only taken here by a directory left by an
++/// earlier process with this pid, so a collision is retried.
++fn create_event_directory() -> MesaResult<PathBuf> {
++    let base = std::env::temp_dir();
++    let pid = std::process::id();
++
++    for _ in 0..MAX_DIRECTORY_ATTEMPTS {
++        let counter = EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
++        let directory = base.join(format!(".mesa-event-{}-{}", pid, counter));
++        match mkdir(&directory, Mode::RWXU) {
++            Ok(()) => return Ok(directory),
++            Err(Errno::EXIST) => continue,
++            Err(err) => return Err(err.into()),
++        }
++    }
++
++    Err(MesaError::WithContext(
++        "failed to create a directory for an event",
++    ))
++}
++
++fn bind_and_connect(socket: &OwnedFd, directory: &Path) -> MesaResult<()> {
++    let path = directory.join("event");
++    let addr = SocketAddrUnix::new(&path)?;
++
++    bind(socket, &addr)?;
++    let connected = connect(socket, &addr);
++    // The socket object outlives its name: it stays alive as long as a descriptor
++    // refers to it, and writes to it remain readable on that descriptor.
++    let _ = unlink(&path);
++    connected?;
++
++    Ok(())
++}
++
++/// Blocks until the descriptor named by `filter` is ready.
++///
++/// The socket is non-blocking, so it is only touched once kqueue says the
++/// operation will not block: a signal cannot stall on a full buffer, and wait()
++/// can grow a timeout later.
++///
++/// The kqueue is local to the call. It is not inherited across fork and carries
++/// no registrations into another process, so it could not be the shared object.
++fn wait_ready(filter: EventFilter) -> MesaResult<()> {
++    let queue = kqueue()?;
++    let change = KEvent::new(filter, EventFlags::ADD | EventFlags::ENABLE, null_mut());
++    let mut events = [MaybeUninit::<KEvent>::uninit(); 1];
++
++    loop {
++        // SAFETY: the descriptor named by `filter` is owned by the caller and
++        // outlives `queue`, which is closed when this function returns.
++        match unsafe { kevent(&queue, &[change], &mut events[..], None) } {
++            Ok((ready, _)) if !ready.is_empty() => return Ok(()),
++            Ok(_) => continue,
++            Err(Errno::INTR) => continue,
++            Err(err) => return Err(err.into()),
++        }
++    }
++}
++
++fn create_self_connected_socket() -> MesaResult<OwnedDescriptor> {
++    let socket = socket_with(
++        AddressFamily::UNIX,
++        SocketType::DGRAM,
++        SocketFlags::empty(),
++        None,
++    )?;
++
++    // macOS has no SOCK_NONBLOCK, so set the flag once the socket exists.
++    fcntl_setfl(&socket, fcntl_getfl(&socket)? | OFlags::NONBLOCK)?;
++
++    let directory = create_event_directory()?;
++    let bound = bind_and_connect(&socket, &directory);
++    let _ = rmdir(&directory);
++    bound?;
++
++    Ok(socket.into())
++}
++
++impl Event {
++    pub fn new() -> MesaResult<Event> {
++        Ok(Event {
++            descriptor: create_self_connected_socket()?,
++        })
++    }
++
++    pub fn add(&mut self, value: u64) -> MesaResult<()> {
++        let raw = self.descriptor.as_raw_descriptor();
++        let bytes = value.to_le_bytes();
++        loop {
++            match write(&self.descriptor, &bytes) {
++                Ok(_) => return Ok(()),
++                Err(Errno::AGAIN) => wait_ready(EventFilter::Write(raw))?,
++                Err(Errno::INTR) => continue,
++                Err(err) => return Err(err.into()),
++            }
++        }
++    }
++
++    pub fn signal(&mut self) -> MesaResult<()> {
++        self.add(1)
++    }
++
++    pub fn wait(&mut self) -> MesaResult<u64> {
++        let raw = self.descriptor.as_raw_descriptor();
++        let mut buf = [0; 8];
++        loop {
++            match read(&self.descriptor, &mut buf) {
++                Ok(_) => return Ok(u64::from_le_bytes(buf)),
++                Err(Errno::AGAIN) => wait_ready(EventFilter::Read(raw))?,
++                Err(Errno::INTR) => continue,
++                Err(err) => return Err(err.into()),
++            }
++        }
++    }
++
++    pub fn try_clone(&self) -> MesaResult<Event> {
++        let clone = self.descriptor.try_clone()?;
++        Ok(Event { descriptor: clone })
++    }
++}
++
++impl TryFrom<MesaHandle> for Event {
++    type Error = MesaError;
++    fn try_from(handle: MesaHandle) -> Result<Self, Self::Error> {
++        if handle.handle_type != MESA_HANDLE_TYPE_SIGNAL_EVENT_FD {
++            return Err(MesaError::InvalidMesaHandle);
++        }
++
++        Ok(Event {
++            descriptor: handle.os_handle,
++        })
++    }
++}
++
++impl From<Event> for MesaHandle {
++    fn from(evt: Event) -> Self {
++        MesaHandle {
++            os_handle: evt.descriptor,
++            handle_type: MESA_HANDLE_TYPE_SIGNAL_EVENT_FD,
++        }
++    }
++}
++
++impl AsBorrowedDescriptor for Event {
++    fn as_borrowed_descriptor(&self) -> &OwnedDescriptor {
++        &self.descriptor
++    }
++}
+diff --git a/src/util/rust/sys/macos/memory_mapping.rs b/src/util/rust/sys/macos/memory_mapping.rs
+new file mode 100644
+index 0000000..7805688
+--- /dev/null
++++ b/src/util/rust/sys/macos/memory_mapping.rs
+@@ -0,0 +1,93 @@
++// Copyright 2026 Mesa3D authors
++// SPDX-License-Identifier: MIT
++
++use std::ffi::c_void;
++use std::os::fd::AsFd;
++use std::ptr::null_mut;
++
++use rustix::mm::mmap;
++use rustix::mm::munmap;
++use rustix::mm::MapFlags;
++use rustix::mm::ProtFlags;
++
++use crate::MesaError;
++use crate::MesaResult;
++use crate::OwnedDescriptor;
++use crate::MESA_MAP_ACCESS_MASK;
++use crate::MESA_MAP_ACCESS_READ;
++use crate::MESA_MAP_ACCESS_RW;
++use crate::MESA_MAP_ACCESS_WRITE;
++
++/// Wraps an anonymous shared memory mapping in the current process. Provides
++/// RAII semantics including munmap when no longer needed.
++#[derive(Debug)]
++pub struct MemoryMapping {
++    pub addr: *mut c_void,
++    pub size: usize,
++}
++
++// SAFETY:
++// MemoryMapping user must ensure it is used by one thread at a time.
++unsafe impl Sync for MemoryMapping {}
++// SAFETY:
++// MemoryMapping user must ensure it is used by one thread at a time.
++unsafe impl Send for MemoryMapping {}
++
++impl Drop for MemoryMapping {
++    fn drop(&mut self) {
++        // SAFETY:
++        // This is safe because we mmap the area at addr ourselves, and nobody
++        // else is holding a reference to it.
++        unsafe {
++            munmap(self.addr, self.size).unwrap();
++        }
++    }
++}
++
++impl MemoryMapping {
++    fn do_mmap(
++        descriptor: &OwnedDescriptor,
++        offset: usize,
++        size: usize,
++        map_info: u32,
++    ) -> MesaResult<MemoryMapping> {
++        let prot = match map_info & MESA_MAP_ACCESS_MASK {
++            MESA_MAP_ACCESS_READ => ProtFlags::READ,
++            MESA_MAP_ACCESS_WRITE => ProtFlags::WRITE,
++            MESA_MAP_ACCESS_RW => ProtFlags::READ | ProtFlags::WRITE,
++            _ => return Err(MesaError::WithContext("incorrect access flags")),
++        };
++
++        // SAFETY:
++        // The inputs to the mmap() system call have been verified, and
++        // the kernel is trusted to deliver a correct result.
++        let addr = unsafe {
++            mmap(
++                null_mut(),
++                size,
++                prot,
++                MapFlags::SHARED,
++                descriptor.as_fd(),
++                offset.try_into().unwrap(),
++            )?
++        };
++
++        Ok(MemoryMapping { addr, size })
++    }
++
++    pub fn from_safe_descriptor(
++        descriptor: OwnedDescriptor,
++        size: usize,
++        map_info: u32,
++    ) -> MesaResult<MemoryMapping> {
++        Self::do_mmap(&descriptor, 0, size, map_info)
++    }
++
++    pub fn from_offset(
++        descriptor: &OwnedDescriptor,
++        offset: usize,
++        size: usize,
++    ) -> MesaResult<MemoryMapping> {
++        Self::do_mmap(descriptor, offset, size, MESA_MAP_ACCESS_RW)
++    }
++}
+diff --git a/src/util/rust/sys/macos/mod.rs b/src/util/rust/sys/macos/mod.rs
+new file mode 100644
+index 0000000..c6657bd
+--- /dev/null
++++ b/src/util/rust/sys/macos/mod.rs
+@@ -0,0 +1,18 @@
++// Copyright 2026 Mesa3D authors
++// SPDX-License-Identifier: MIT
++
++// The atomic memory sentinel backs a cross-domain use case that only exists on
++// X11 and Wayland, so macOS reuses the stub. Nothing else from stub is used.
++#[path = "../stub/atomic_memory_sentinel.rs"]
++pub mod atomic_memory_sentinel;
++pub mod descriptor;
++pub mod event;
++pub mod memory_mapping;
++pub mod pipe;
++pub mod shm;
++pub mod tube;
++pub mod wait_context;
++
++pub use memory_mapping::MemoryMapping;
++pub use shm::page_size;
++pub use shm::SharedMemory;
+diff --git a/src/util/rust/sys/macos/pipe.rs b/src/util/rust/sys/macos/pipe.rs
+new file mode 100644
+index 0000000..4fe458b
+--- /dev/null
++++ b/src/util/rust/sys/macos/pipe.rs
+@@ -0,0 +1,74 @@
++// Copyright 2026 Mesa3D authors
++// SPDX-License-Identifier: MIT
++
++use std::os::fd::AsFd;
++
++use rustix::io::read;
++use rustix::io::write;
++use rustix::pipe::pipe;
++
++use crate::AsBorrowedDescriptor;
++use crate::AsRawDescriptor;
++use crate::FromRawDescriptor;
++use crate::MesaResult;
++use crate::OwnedDescriptor;
++use crate::RawDescriptor;
++
++pub struct ReadPipe {
++    descriptor: OwnedDescriptor,
++}
++
++pub struct WritePipe {
++    descriptor: OwnedDescriptor,
++}
++
++pub fn create_pipe() -> MesaResult<(ReadPipe, WritePipe)> {
++    let (read_pipe, write_pipe) = pipe()?;
++    Ok((
++        ReadPipe {
++            descriptor: read_pipe.into(),
++        },
++        WritePipe {
++            descriptor: write_pipe.into(),
++        },
++    ))
++}
++
++impl ReadPipe {
++    pub fn read(&self, data: &mut [u8]) -> MesaResult<usize> {
++        let bytes_read = read(&self.descriptor, data)?;
++        Ok(bytes_read)
++    }
++}
++
++impl AsBorrowedDescriptor for ReadPipe {
++    fn as_borrowed_descriptor(&self) -> &OwnedDescriptor {
++        &self.descriptor
++    }
++}
++
++impl WritePipe {
++    pub fn new(descriptor: RawDescriptor) -> WritePipe {
++        // SAFETY: Safe because we know the underlying OS descriptor is valid and
++        // owned by us.
++        let owned = unsafe { OwnedDescriptor::from_raw_descriptor(descriptor) };
++        WritePipe { descriptor: owned }
++    }
++
++    pub fn write(&self, data: &[u8]) -> MesaResult<usize> {
++        let bytes_written = write(self.descriptor.as_fd(), data)?;
++        Ok(bytes_written)
++    }
++}
++
++impl AsBorrowedDescriptor for WritePipe {
++    fn as_borrowed_descriptor(&self) -> &OwnedDescriptor {
++        &self.descriptor
++    }
++}
++
++impl AsRawDescriptor for WritePipe {
++    fn as_raw_descriptor(&self) -> RawDescriptor {
++        self.descriptor.as_raw_descriptor()
++    }
++}
+diff --git a/src/util/rust/sys/macos/shm.rs b/src/util/rust/sys/macos/shm.rs
+new file mode 100644
+index 0000000..f5fc2e9
+--- /dev/null
++++ b/src/util/rust/sys/macos/shm.rs
+@@ -0,0 +1,70 @@
++// Copyright 2026 Mesa3D authors
++// SPDX-License-Identifier: MIT
++
++use std::ffi::CStr;
++use std::os::fd::AsRawFd;
++use std::os::fd::IntoRawFd;
++use std::os::unix::io::OwnedFd;
++use std::sync::atomic::AtomicU64;
++use std::sync::atomic::Ordering;
++
++use rustix::fs::ftruncate;
++use rustix::fs::Mode;
++use rustix::shm;
++
++use crate::descriptor::AsRawDescriptor;
++use crate::descriptor::IntoRawDescriptor;
++use crate::MesaResult;
++use crate::RawDescriptor;
++
++static SHM_COUNTER: AtomicU64 = AtomicU64::new(0);
++
++pub struct SharedMemory {
++    fd: OwnedFd,
++    size: u64,
++}
++
++impl SharedMemory {
++    /// Creates a new shared memory file descriptor with the given size.
++    ///
++    /// macOS has no `memfd_create`, so this is `shm_open` followed by an
++    /// immediate `shm_unlink`: the name leaves the namespace while the open
++    /// descriptor keeps the object alive.
++    pub fn new(_debug_name: &CStr, size: u64) -> MesaResult<SharedMemory> {
++        let counter = SHM_COUNTER.fetch_add(1, Ordering::Relaxed);
++        // shm names on macOS are limited to PSHMNAMLEN (31) characters.
++        let name = format!("/mesa-{}-{}", std::process::id(), counter);
++
++        let fd = shm::open(
++            name.as_str(),
++            shm::OFlags::CREATE | shm::OFlags::EXCL | shm::OFlags::RDWR,
++            Mode::RUSR | Mode::WUSR,
++        )?;
++        shm::unlink(name.as_str())?;
++
++        ftruncate(&fd, size)?;
++
++        Ok(SharedMemory { fd, size })
++    }
++
++    /// Gets the size in bytes of the shared memory.
++    pub fn size(&self) -> u64 {
++        self.size
++    }
++}
++
++impl AsRawDescriptor for SharedMemory {
++    fn as_raw_descriptor(&self) -> RawDescriptor {
++        self.fd.as_raw_fd()
++    }
++}
++
++impl IntoRawDescriptor for SharedMemory {
++    fn into_raw_descriptor(self) -> RawDescriptor {
++        self.fd.into_raw_fd()
++    }
++}
++
++pub fn page_size() -> MesaResult<u64> {
++    Ok(rustix::param::page_size() as _)
++}
+diff --git a/src/util/rust/sys/macos/tube.rs b/src/util/rust/sys/macos/tube.rs
+new file mode 100644
+index 0000000..f906131
+--- /dev/null
++++ b/src/util/rust/sys/macos/tube.rs
+@@ -0,0 +1,266 @@
++// Copyright 2026 Mesa3D authors
++// SPDX-License-Identifier: MIT
++
++use std::io::Error;
++use std::io::ErrorKind;
++use std::io::IoSlice;
++use std::io::IoSliceMut;
++use std::mem::MaybeUninit;
++use std::os::fd::AsFd;
++use std::path::Path;
++
++use rustix::cmsg_space;
++use rustix::fs::fcntl_getfl;
++use rustix::fs::fcntl_setfl;
++use rustix::fs::OFlags;
++use rustix::net::accept;
++use rustix::net::bind;
++use rustix::net::connect;
++use rustix::net::listen;
++use rustix::net::recvmsg;
++use rustix::net::sendmsg;
++use rustix::net::socket_with;
++use rustix::net::sockopt::set_socket_nosigpipe;
++use rustix::net::sockopt::socket_type;
++use rustix::net::AddressFamily;
++use rustix::net::RecvAncillaryBuffer;
++use rustix::net::RecvAncillaryMessage;
++use rustix::net::RecvFlags;
++use rustix::net::SendAncillaryBuffer;
++use rustix::net::SendAncillaryMessage;
++use rustix::net::SendFlags;
++use rustix::net::SocketAddrUnix;
++use rustix::net::SocketFlags;
++use rustix::net::SocketType;
++use rustix::path::Arg;
++
++use crate::AsBorrowedDescriptor;
++use crate::MesaError;
++use crate::MesaResult;
++use crate::OwnedDescriptor;
++use crate::TubeType;
++
++const MAX_IDENTIFIERS: usize = 28;
++
++// macOS AF_UNIX sockets have no SOCK_SEQPACKET, so packet tubes are emulated
++// over SOCK_STREAM. Each message is framed with an 8-byte header ([u32 payload
++// length][u32 descriptor count]); the descriptors ride on the header via
++// SCM_RIGHTS and the payload follows.
++
++// There is no MSG_NOSIGNAL either, and this runs inside a C++ host process that
++// has not reset SIGPIPE, so writing to a closed peer would kill it.
++// SO_NOSIGPIPE turns those writes into EPIPE, which callers already handle. It
++// lives on the socket object, so it also covers descriptors sent via SCM_RIGHTS.
++fn set_nosigpipe<F: AsFd>(socket: &F) -> MesaResult<()> {
++    set_socket_nosigpipe(socket, true)?;
++    Ok(())
++}
++
++pub struct Tube {
++    socket: OwnedDescriptor,
++}
++
++impl TryFrom<OwnedDescriptor> for Tube {
++    type Error = MesaError;
++
++    fn try_from(socket: OwnedDescriptor) -> Result<Self, Self::Error> {
++        let ty = socket_type(&socket)?;
++        match ty {
++            SocketType::STREAM => {
++                set_nosigpipe(&socket)?;
++                Ok(Tube { socket })
++            }
++            _ => Err(MesaError::Unsupported),
++        }
++    }
++}
++
++impl TryFrom<SocketType> for TubeType {
++    type Error = std::io::Error;
++
++    fn try_from(ty: SocketType) -> Result<Self, Self::Error> {
++        match ty {
++            // Packet tubes are emulated over STREAM, and only packet tubes are
++            // created here, so a STREAM socket is a packet tube.
++            SocketType::STREAM => Ok(TubeType::Packet),
++            ty => {
++                log::warn!("Unsupported socket type {ty:?}");
++                Err(Error::from(ErrorKind::Unsupported))
++            }
++        }
++    }
++}
++
++fn recv_exact(
++    socket: &OwnedDescriptor,
++    buf: &mut [u8],
++    fds: &mut Vec<OwnedDescriptor>,
++) -> MesaResult<()> {
++    let mut offset = 0;
++    while offset < buf.len() {
++        let mut iovecs = [IoSliceMut::new(&mut buf[offset..])];
++        let mut space = [MaybeUninit::<u8>::uninit(); cmsg_space!(ScmRights(MAX_IDENTIFIERS))];
++        let mut cmsg_buffer = RecvAncillaryBuffer::new(&mut space);
++        let r = recvmsg(socket, &mut iovecs, &mut cmsg_buffer, RecvFlags::empty())?;
++        for cmsg in cmsg_buffer.drain() {
++            if let RecvAncillaryMessage::ScmRights(received) = cmsg {
++                fds.extend(received.into_iter().map(Into::into));
++            }
++        }
++        if r.bytes == 0 {
++            return Err(MesaError::from(Error::from(ErrorKind::UnexpectedEof)));
++        }
++        offset += r.bytes;
++    }
++    Ok(())
++}
++
++fn write_all(socket: &OwnedDescriptor, mut data: &[u8]) -> MesaResult<()> {
++    while !data.is_empty() {
++        let n = rustix::io::write(socket, data)?;
++        if n == 0 {
++            return Err(MesaError::from(Error::from(ErrorKind::WriteZero)));
++        }
++        data = &data[n..];
++    }
++    Ok(())
++}
++
++impl Tube {
++    pub fn new<P: AsRef<Path> + Arg>(path: P, kind: TubeType) -> MesaResult<Tube> {
++        // Every tube here carries framed packets, so a raw byte stream would be
++        // unparseable to its peer. Refuse rather than return the wrong thing.
++        if !matches!(kind, TubeType::Packet) {
++            return Err(MesaError::Unsupported);
++        }
++
++        let socket = socket_with(
++            AddressFamily::UNIX,
++            SocketType::STREAM,
++            SocketFlags::empty(),
++            None,
++        )?;
++
++        set_nosigpipe(&socket)?;
++
++        let unix_addr = SocketAddrUnix::new(path)?;
++        connect(&socket, &unix_addr)?;
++
++        Ok(Tube {
++            socket: socket.into(),
++        })
++    }
++
++    pub fn send(&self, opaque_data: &[u8], descriptors: &[OwnedDescriptor]) -> MesaResult<usize> {
++        let data_len = opaque_data.len() as u32;
++        let num_fds = descriptors.len() as u32;
++        let mut header = [0u8; 8];
++        header[0..4].copy_from_slice(&data_len.to_ne_bytes());
++        header[4..8].copy_from_slice(&num_fds.to_ne_bytes());
++
++        let mut space = [MaybeUninit::<u8>::uninit(); cmsg_space!(ScmRights(MAX_IDENTIFIERS))];
++        let mut cmsg_buffer = SendAncillaryBuffer::new(&mut space);
++
++        let borrowed_fds: Vec<_> = descriptors.iter().map(AsFd::as_fd).collect();
++        // Only attach an SCM_RIGHTS control message when there are descriptors:
++        // sending an empty control message is not portable.
++        if !borrowed_fds.is_empty() {
++            let cmsg = SendAncillaryMessage::ScmRights(&borrowed_fds);
++            cmsg_buffer.push(cmsg);
++        }
++
++        // The header (8 bytes) is small enough to be delivered in a single
++        // sendmsg, keeping the descriptors attached to it.
++        sendmsg(
++            &self.socket,
++            &[IoSlice::new(&header)],
++            &mut cmsg_buffer,
++            SendFlags::empty(),
++        )?;
++
++        write_all(&self.socket, opaque_data)?;
++
++        Ok(opaque_data.len())
++    }
++
++    pub fn receive(&self, opaque_data: &mut [u8]) -> MesaResult<(usize, Vec<OwnedDescriptor>)> {
++        let mut header = [0u8; 8];
++        let mut received_descriptors: Vec<OwnedDescriptor> = Vec::new();
++        recv_exact(&self.socket, &mut header, &mut received_descriptors)?;
++
++        let data_len =
++            u32::from_ne_bytes([header[0], header[1], header[2], header[3]]) as usize;
++        let num_descriptors =
++            u32::from_ne_bytes([header[4], header[5], header[6], header[7]]) as usize;
++        if data_len > opaque_data.len() {
++            return Err(MesaError::WithContext("received message exceeds buffer"));
++        }
++
++        recv_exact(
++            &self.socket,
++            &mut opaque_data[..data_len],
++            &mut received_descriptors,
++        )?;
++
++        // send() records how many descriptors it attached, so a different count
++        // means a truncated or malformed message.
++        if received_descriptors.len() != num_descriptors {
++            return Err(MesaError::WithContext(
++                "received descriptor count does not match the message header",
++            ));
++        }
++
++        Ok((data_len, received_descriptors))
++    }
++}
++
++impl AsBorrowedDescriptor for Tube {
++    fn as_borrowed_descriptor(&self) -> &OwnedDescriptor {
++        &self.socket
++    }
++}
++
++pub struct Listener {
++    socket: OwnedDescriptor,
++}
++
++impl Listener {
++    /// Creates a new `Listener` bound to the given path.
++    pub fn bind<P: AsRef<Path> + Arg>(path: P) -> MesaResult<Listener> {
++        let socket = socket_with(
++            AddressFamily::UNIX,
++            SocketType::STREAM,
++            SocketFlags::empty(),
++            None,
++        )?;
++
++        let unix_addr = SocketAddrUnix::new(path)?;
++        bind(&socket, &unix_addr)?;
++        listen(&socket, 128)?;
++
++        fcntl_setfl(&socket, OFlags::NONBLOCK)?;
++
++        Ok(Listener {
++            socket: socket.into(),
++        })
++    }
++
++    pub fn accept(&self) -> MesaResult<Tube> {
++        let accepted_fd = accept(&self.socket)?;
++        let descriptor: OwnedDescriptor = accepted_fd.into();
++        set_nosigpipe(&descriptor)?;
++        // BSD accepted sockets inherit the listener's file status flags, unlike
++        // Linux, so this one arrives non-blocking. Clear it: reassembling a
++        // message takes more than one recvmsg, and those must wait for the rest
++        // rather than fail with EAGAIN.
++        let flags = fcntl_getfl(&descriptor)?;
++        fcntl_setfl(&descriptor, flags.difference(OFlags::NONBLOCK))?;
++        Ok(Tube { socket: descriptor })
++    }
++}
++
++impl AsBorrowedDescriptor for Listener {
++    fn as_borrowed_descriptor(&self) -> &OwnedDescriptor {
++        &self.socket
++    }
++}
+diff --git a/src/util/rust/sys/macos/wait_context.rs b/src/util/rust/sys/macos/wait_context.rs
+new file mode 100644
+index 0000000..5e51474
+--- /dev/null
++++ b/src/util/rust/sys/macos/wait_context.rs
+@@ -0,0 +1,84 @@
++// Copyright 2026 Mesa3D authors
++// SPDX-License-Identifier: MIT
++
++use std::mem::MaybeUninit;
++use std::os::fd::OwnedFd;
++use std::ptr::null_mut;
++
++use rustix::event::kqueue::kevent;
++use rustix::event::kqueue::kqueue;
++use rustix::event::kqueue::Event;
++use rustix::event::kqueue::EventFilter;
++use rustix::event::kqueue::EventFlags;
++use rustix::io::Errno;
++
++use crate::AsRawDescriptor;
++use crate::MesaResult;
++use crate::OwnedDescriptor;
++use crate::WaitEvent;
++use crate::WaitTimeout;
++use crate::WAIT_CONTEXT_MAX;
++
++/// macOS uses kqueue rather than epoll for readiness notification.
++pub struct WaitContext {
++    kqueue: OwnedFd,
++}
++
++impl WaitContext {
++    pub fn new() -> MesaResult<WaitContext> {
++        Ok(WaitContext { kqueue: kqueue()? })
++    }
++
++    fn apply(&self, change: &Event) -> MesaResult<()> {
++        let mut events: [Event; 0] = [];
++        // SAFETY: the descriptor named by `change` is owned by the caller, which
++        // keeps it alive at least until the matching `delete` call.
++        unsafe { kevent(&self.kqueue, &[*change], &mut events[..], None)? };
++        Ok(())
++    }
++
++    pub fn add(&mut self, connection_id: u64, descriptor: &OwnedDescriptor) -> MesaResult<()> {
++        let change = Event::new(
++            EventFilter::Read(descriptor.as_raw_descriptor()),
++            EventFlags::ADD | EventFlags::ENABLE,
++            connection_id as *mut std::ffi::c_void,
++        );
++        self.apply(&change)
++    }
++
++    pub fn wait(&mut self, timeout: WaitTimeout) -> MesaResult<Vec<WaitEvent>> {
++        let timeout = match timeout {
++            WaitTimeout::Finite(duration) => Some(duration),
++            WaitTimeout::NoTimeout => None,
++        };
++
++        let mut buffer = [MaybeUninit::<Event>::uninit(); WAIT_CONTEXT_MAX];
++        let events = loop {
++            // SAFETY: the descriptors registered with `add` are owned by the
++            // caller and stay valid until they are removed with `delete`.
++            match unsafe { kevent(&self.kqueue, &[], &mut buffer[..], timeout) } {
++                Ok((events, _)) => break events,
++                Err(Errno::INTR) => continue,
++                Err(err) => return Err(err.into()),
++            }
++        };
++
++        Ok(events
++            .iter()
++            .map(|event| WaitEvent {
++                connection_id: event.udata() as u64,
++                readable: matches!(event.filter(), EventFilter::Read(_)),
++                hung_up: event.flags().contains(EventFlags::EOF),
++            })
++            .collect())
++    }
++
++    pub fn delete(&mut self, descriptor: &OwnedDescriptor) -> MesaResult<()> {
++        let change = Event::new(
++            EventFilter::Read(descriptor.as_raw_descriptor()),
++            EventFlags::DELETE,
++            null_mut(),
++        );
++        self.apply(&change)
++    }
++}
+diff --git a/src/util/rust/sys/mod.rs b/src/util/rust/sys/mod.rs
+index 6a6c99e..b3b3ff8 100644
+--- a/src/util/rust/sys/mod.rs
++++ b/src/util/rust/sys/mod.rs
+@@ -4,7 +4,10 @@
+ #[cfg(any(target_os = "android", target_os = "linux"))]
+ pub mod linux;
+ 
+-#[cfg(any(target_os = "fuchsia", target_os = "macos", target_os = "nto"))]
++#[cfg(target_os = "macos")]
++pub mod macos;
++
++#[cfg(any(target_os = "fuchsia", target_os = "nto"))]
+ pub mod stub;
+ 
+ #[cfg(windows)]
+@@ -18,7 +21,9 @@ cfg_if::cfg_if! {
+         pub use linux as platform;
+     } else if #[cfg(windows)] {
+         pub use windows as platform;
+-    } else if #[cfg(any(target_os = "fuchsia", target_os = "macos", target_os = "nto"))] {
++    } else if #[cfg(target_os = "macos")] {
++        pub use macos as platform;
++    } else if #[cfg(any(target_os = "fuchsia", target_os = "nto"))] {
+         pub use stub as platform;
+     } else {
+         compile_error!("Unsupported platform");

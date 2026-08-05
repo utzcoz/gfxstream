@@ -22,6 +22,13 @@ git_repository(
     ],
     patches = [
         "//third_party/mesa:PATCH.0001_disable_vk_envvar_modification_for_testing.patch",
+        "//third_party/mesa:PATCH.0002_gfxstream_guest_macos_external_memory.patch",
+        "//third_party/mesa:PATCH.0003_gfxstream_guest_no_linux_guest_build_on_apple.patch",
+        "//third_party/mesa:PATCH.0004_virtgpu_kumquat_finish_null_guard.patch",
+        "//third_party/mesa:PATCH.0005_gfxstream_guest_macos_linux_headers.patch",
+        "//third_party/mesa:PATCH.0006_gfxstream_guest_macos_anativewindow.patch",
+        "//third_party/mesa:PATCH.0007_gfxstream_guest_macos_android_hardware_buffer.patch",
+        "//third_party/mesa:PATCH.0008_mesa3d_util_macos_backend.patch",
     ],
     remote = "https://android.googlesource.com/platform/external/mesa3d.git",
 )
@@ -68,6 +75,7 @@ mesa_crate_deps.spec(
         "net",
         "param",
         "pipe",
+        "shm",
         "thread",
         "use-libc",
         "use-libc-auxv",

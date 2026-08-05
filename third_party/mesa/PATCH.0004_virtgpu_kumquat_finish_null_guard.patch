@@ -1,0 +1,41 @@
+From 488bad87e00e104781ee4d1313d7084457e23cee Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Mon, 27 Jul 2026 23:45:30 +0800
+Subject: [PATCH 4/8] virtio: magma-gpu-rs: accept a null device in
+ virtgpu_kumquat_finish
+
+virtgpu_kumquat_init leaves the caller's pointer untouched when it fails,
+and VirtGpuKumquatDevice releases the device unconditionally from its
+destructor, so virtgpu_kumquat_finish is reached with a null pointer on
+every failed initialization. Box::from_raw on a null pointer raises a
+non-unwinding panic, which aborts the process and takes with it the error
+that explained why initialization failed. The surrounding catch_unwind
+cannot intercept that.
+
+Make the release side tolerate null instead of fixing the one caller.
+This is a C init/finish pair, and C's canonical release function treats
+null as a no-op, so C callers reasonably expect that; it also covers
+callers we do not control.
+
+Fixes: f2b07903abaf ("mesa: import virtgpu_kumquat_ffi")
+---
+ src/virtio/virtgpu_kumquat_ffi/lib.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/virtio/virtgpu_kumquat_ffi/lib.rs b/src/virtio/virtgpu_kumquat_ffi/lib.rs
+index e0a1fba..db0524d 100644
+--- a/src/virtio/virtgpu_kumquat_ffi/lib.rs
++++ b/src/virtio/virtgpu_kumquat_ffi/lib.rs
+@@ -126,6 +126,12 @@ pub unsafe extern "C" fn virtgpu_kumquat_init(
+ #[no_mangle]
+ pub extern "C" fn virtgpu_kumquat_finish(ptr: &mut *mut virtgpu_kumquat_ffi) -> i32 {
+     catch_unwind(AssertUnwindSafe(|| {
++        // Accept a null pointer, the way free(3) does: a failed init leaves
++        // it null, and `Box::from_raw` on null aborts instead of unwinding.
++        if (*ptr).is_null() {
++            return NO_ERROR;
++        }
++
+         // SAFETY:
+         // The pointer `*ptr` must have been previously allocated by `virtgpu_kumquat_init`,
+         // which uses `Box::into_raw`, and must not have been freed yet.

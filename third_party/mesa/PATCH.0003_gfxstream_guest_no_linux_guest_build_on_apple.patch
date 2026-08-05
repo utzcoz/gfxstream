@@ -1,0 +1,37 @@
+From 01760d8361066d4ac9a480bf7d60146bbac9bf65 Mon Sep 17 00:00:00 2001
+From: utzcoz <utzcoz@outlook.com>
+Date: Thu, 6 Aug 2026 22:42:52 +0800
+Subject: [PATCH 3/8] gfxstream/guest: do not define LINUX_GUEST_BUILD on
+ non-Linux hosts
+
+LINUX_GUEST_BUILD is defined for every host that is not Windows or Fuchsia, so
+Apple gets it as well. ResourceTracker.cpp then compiles DRM_FORMAT_MOD_LINEAR
+and updateMemoryTypeBits uses inside LINUX_GUEST_BUILD blocks, while
+<drm_fourcc.h> and the definition of updateMemoryTypeBits are guarded on
+DETECT_OS_LINUX and DETECT_OS_ANDROID. The guards disagree, so the users are
+compiled and the things they need are not.
+
+List the systems that are not Linux instead, so that adding another one is a
+single edit. WINDOWS_GUEST_BUILD goes with it: nothing has referenced it since
+it was introduced.
+---
+ src/gfxstream/guest/meson.build | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/gfxstream/guest/meson.build b/src/gfxstream/guest/meson.build
+index 5134cc297af..96bf8495f97 100644
+--- a/src/gfxstream/guest/meson.build
++++ b/src/gfxstream/guest/meson.build
+@@ -16,9 +16,9 @@ endif
+ gfxstream_guest_args = cpp_msvc_compat_args + soong_compat_cpp_args + ['-D_FILE_OFFSET_BITS=64']
+ 
+ # Our internal guest build
+-if host_machine.system() == 'windows'
+-    gfxstream_guest_args += '-DWINDOWS_GUEST_BUILD'
+-elif host_machine.system() != 'fuchsia'
++non_linux_systems = ['darwin', 'fuchsia', 'windows']
++
++if host_machine.system() not in non_linux_systems and not with_platform_android and not with_gfxstream_emulated_android
+     gfxstream_guest_args += '-DLINUX_GUEST_BUILD'
+ endif
+ 

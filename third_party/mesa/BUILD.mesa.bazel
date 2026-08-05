@@ -33,7 +33,6 @@ MESA_DEFAULT_COPTS = [
     "-DHAVE___BUILTIN_POPCOUNTLL",
     "-DHAVE___BUILTIN_UNREACHABLE",
     "-DHAVE_COMPRESSION",
-    "-DHAVE_ENDIAN_H",
     "-DHAVE_FUNC_ATTRIBUTE_ALIAS",
     "-DHAVE_FUNC_ATTRIBUTE_FLATTEN",
     "-DHAVE_FUNC_ATTRIBUTE_FORMAT",
@@ -42,15 +41,12 @@ MESA_DEFAULT_COPTS = [
     "-DHAVE_FUNC_ATTRIBUTE_RETURNS_NONNULL",
     "-DHAVE_FUNC_ATTRIBUTE_UNUSED",
     "-DHAVE_FUNC_ATTRIBUTE_WARN_UNUSED_RESULT",
-    "-DHAVE_LIBDRM",
     "-DHAVE_PTHREAD=1",
     "-DHAVE_REALLOCARRAY",
-    "-DHAVE_SECURE_GETENV",
     "-DHAVE_STRUCT_TIMESPEC",
     "-DHAVE_SYSCONF",
     "-DHAVE_TIMESPEC_GET",
     "-DHAVE_ZLIB",
-    "-DMAJOR_IN_SYSMACROS",
     "-DMESA_DEBUG=0",
     "-DMESA_LLVM_VERSION_STRING=\\\"16.0.0\\\"",
     "-DPACKAGE_BUGREPORT=\\\"https://bugs.freedesktop.org/enter_bug.cgi?product=Mesa\\\"",
@@ -115,7 +111,20 @@ MESA_DEFAULT_COPTS = [
     "-Wno-unused-parameter",
     "-Wno-unused-private-field",
     "-Wno-visibility",
-]
+] + select({
+    # macOS lacks <endian.h>, libdrm, secure_getenv, and puts major()/minor()
+    # in <sys/types.h> rather than <sys/sysmacros.h>. mesa's own headers already
+    # have the corresponding Apple code paths.
+    "@platforms//os:macos": [
+        "-DMAJOR_IN_TYPES",
+    ],
+    "//conditions:default": [
+        "-DHAVE_ENDIAN_H",
+        "-DHAVE_LIBDRM",
+        "-DHAVE_SECURE_GETENV",
+        "-DMAJOR_IN_SYSMACROS",
+    ],
+})
 
 MESA_DEFAULT_CXXOPTS = []
 
@@ -942,14 +951,19 @@ cc_library(
         "src/util/u_queue.c",
         "src/util/u_range_remap.c",
         "src/util/u_string.c",
-        "src/util/u_sync_provider.c",
         "src/util/u_thread.c",
         "src/util/u_vector.c",
         "src/util/u_worklist.c",
         "src/util/vl_zscan_data.c",
         "src/util/vma.c",
         "src/util/xmlconfig.c",
-    ],
+    ] + select({
+        # The DRM sync provider uses libdrm; macOS uses the header's inline stub.
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+            "src/util/u_sync_provider.c",
+        ],
+    }),
     hdrs = [
         "include/c99_compat.h",
         "include/no_extern_c.h",
@@ -968,9 +982,13 @@ cc_library(
     deps = [
         ":mesa_util_blake",
         ":mesa_util_c11",
-        "@drm//:libdrm",
         "@zlib",
-    ],
+    ] + select({
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+            "@drm//:libdrm",
+        ],
+    }),
 )
 
 cc_library(
@@ -2097,9 +2115,13 @@ cc_library(
         ":mesa_compiler_nir",
         ":mesa_drm",
         ":mesa_util",
-        "@drm//:libdrm",
         "@swiftshader//:swiftshader_llvm",
-    ],
+    ] + select({
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+            "@drm//:libdrm",
+        ],
+    }),
 )
 
 cc_library(
@@ -2828,10 +2850,15 @@ cc_library(
         "src/vulkan/runtime/vk_video.c",
         "src/vulkan/runtime/vk_ycbcr_conversion.c",
         "src/vulkan/wsi/wsi_common.c",
-        "src/vulkan/wsi/wsi_common_drm.c",
         "src/vulkan/wsi/wsi_common_entrypoints.c",
         "src/vulkan/wsi/wsi_common_headless.c",
-    ],
+    ] + select({
+        # The DRM window-system integration needs libdrm/xf86drm.
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+            "src/vulkan/wsi/wsi_common_drm.c",
+        ],
+    }),
     hdrs = [
         "src/vulkan/runtime/astc_spv.h",
         "src/vulkan/runtime/bvh/hploc_internal.spv.h",
@@ -2958,8 +2985,12 @@ cc_library(
         ":mesa_util_c11",
         ":mesa_util_format",
         ":mesa_vulkan_util",
-        "@drm//:libdrm",
-    ],
+    ] + select({
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+            "@drm//:libdrm",
+        ],
+    }),
     alwayslink = 1,
 )
 
@@ -3127,12 +3158,6 @@ cc_library(
     name = "mesa_gfxstream_guest_platform",
     srcs = [
         "src/gfxstream/guest/platform/VirtGpu.cpp",
-        "src/gfxstream/guest/platform/drm/DrmSync.cpp",
-        "src/gfxstream/guest/platform/drm/DrmSync.h",
-        "src/gfxstream/guest/platform/drm/DrmVirtGpu.h",
-        "src/gfxstream/guest/platform/drm/DrmVirtGpuBlob.cpp",
-        "src/gfxstream/guest/platform/drm/DrmVirtGpuBlobMapping.cpp",
-        "src/gfxstream/guest/platform/drm/DrmVirtGpuDevice.cpp",
         "src/gfxstream/guest/platform/kumquat/VirtGpuKumquat.h",
         "src/gfxstream/guest/platform/kumquat/VirtGpuKumquatBlob.cpp",
         "src/gfxstream/guest/platform/kumquat/VirtGpuKumquatBlobMapping.cpp",
@@ -3141,7 +3166,21 @@ cc_library(
         "src/gfxstream/guest/platform/kumquat/VirtGpuKumquatSync.h",
         "src/gfxstream/guest/platform/kumquat/vulkan-mapper/GfxStreamVulkanMapper.cpp",
         "src/gfxstream/guest/platform/kumquat/vulkan-mapper/GfxStreamVulkanMapper.h",
-    ],
+    ] + select({
+        # macOS has no native DRM/libdrm virtio-gpu backend; the native platform
+        # entry points delegate to the kumquat userspace backend instead.
+        "@platforms//os:macos": [
+            "@//third_party/mesa:macos_virtgpu_backend.cpp",
+        ],
+        "//conditions:default": [
+            "src/gfxstream/guest/platform/drm/DrmSync.cpp",
+            "src/gfxstream/guest/platform/drm/DrmSync.h",
+            "src/gfxstream/guest/platform/drm/DrmVirtGpu.h",
+            "src/gfxstream/guest/platform/drm/DrmVirtGpuBlob.cpp",
+            "src/gfxstream/guest/platform/drm/DrmVirtGpuBlobMapping.cpp",
+            "src/gfxstream/guest/platform/drm/DrmVirtGpuDevice.cpp",
+        ],
+    }),
     hdrs = glob([
         "src/gfxstream/guest/platform/include/**/*.h",
     ]),
@@ -3157,8 +3196,12 @@ cc_library(
         ":mesa_virtgpu_kumquat_ffi",
         ":mesa_virtio",
         ":mesa_vulkan_util",
-        "@drm//:libdrm",
-    ],
+    ] + select({
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+            "@drm//:libdrm",
+        ],
+    }),
 )
 
 cc_library(
@@ -3435,6 +3478,16 @@ cc_library(
 cc_shared_library(
     name = "mesa_gfxstream_guest_vulkan",
     shared_lib_name = "vulkan.ranchu.so",
+    # The generated Vulkan entrypoint tables reference unimplemented entrypoints
+    # as weak undefined symbols that are expected to resolve to NULL. On macOS
+    # this requires allowing dynamic lookup of undefined symbols.
+    user_link_flags = select({
+        "@platforms//os:macos": [
+            "-Wl,-undefined,dynamic_lookup",
+            "-Wl,-flat_namespace",
+        ],
+        "//conditions:default": [],
+    }),
     deps = [
         ":mesa_gfxstream_guest_vulkan_impl",
     ],
