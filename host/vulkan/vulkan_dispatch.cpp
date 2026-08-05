@@ -119,6 +119,16 @@ static void initIcdPaths(bool forTesting) {
 #endif
     if (androidIcd == "") {
         // Rely on user to set VK_DRIVER_FILES
+#ifdef __APPLE__
+        // The external driver selected via VK_DRIVER_FILES on macOS is normally
+        // MoltenVK. Apply the MoltenVK argument-buffer workaround here too: with
+        // Metal argument buffers enabled, pipelines that bind an immutable YCbCr
+        // sampler (the YUV compositor pipelines) fail SPIR-V-to-MSL conversion
+        // ("argument buffer resource base type could not be determined") and are
+        // never built, which later aborts compositing a YUV layer. MVK_CONFIG_*
+        // variables are ignored by non-MoltenVK drivers. See b/364055067.
+        gfxstream::base::setEnvironmentVariable("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0");
+#endif
         return;
     }
 
