@@ -117,6 +117,28 @@ jobs:
         --test_env=GFXSTREAM_TESTING_VULKAN_LOADER=/opt/homebrew/lib/libvulkan.1.dylib
         --test_env=GFXSTREAM_TESTING_VULKAN_ICD=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
 
+  # The end2end tests exercise the full guest-to-host path on macOS: the mesa
+  # guest driver talks to the kumquat server through the macOS IPC layer, and the
+  # host renders with ANGLE (GLES) on top of MoltenVK (Vulkan). This reuses the
+  # gles_angle_vulkan_moltenvk environment from the framebuffer job. The run is
+  # scoped to the composition tests, which drive the whole pipeline.
+  run-gfxstream-bazel-end2end-macos:
+    uses: ./.github/workflows/presubmit_bazel.yml
+    with:
+      runner: macos-26
+      build-targets: //tests/end2end:gfxstream_end2end_tests
+      graphics-drivers: gles_angle_vulkan_moltenvk
+      run-tests: true
+      test-targets: //tests/end2end:gfxstream_end2end_tests
+      # The guest driver and the kumquat server are partly Rust, so ask for a
+      # backtrace: a panic in either of them is otherwise reported as a bare
+      # abort with no indication of where it came from.
+      test-bazel-args: >-
+        --test_env=GFXSTREAM_TESTING_VULKAN_LOADER=/opt/homebrew/lib/libvulkan.1.dylib
+        --test_env=GFXSTREAM_TESTING_VULKAN_ICD=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
+        --test_env=RUST_BACKTRACE=full
+        --test_arg=--gtest_filter=*CompositionTest*OverVirtioGpuAsg*
+
   run-gfxstream-cmake-build:
     runs-on: ubuntu-22.04
     steps:

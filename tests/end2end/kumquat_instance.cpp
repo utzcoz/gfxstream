@@ -14,8 +14,11 @@
 
 #include "kumquat_instance.h"
 
+#if defined(__linux__)
 #include <linux/prctl.h>
 #include <sys/prctl.h>
+#endif
+#include <signal.h>
 #include <unistd.h>
 
 #include <gmock/gmock.h>
@@ -55,7 +58,9 @@ void KumquatInstance::SetUp(bool withGl, bool withVk, std::string features) {
 
     pid_t pid = fork();
     if (pid == 0) {
+#if defined(__linux__)
         prctl(PR_SET_PDEATHSIG, SIGHUP);  // Die when parent dies
+#endif
         close(fds[0]);
         execl(kumquatCommand.c_str(), kumquatCommand.c_str(), gpu_socket_cmd.c_str(),
               capset_names.c_str(), renderer_features.c_str(), pipe_descriptor.c_str(), nullptr);
@@ -73,7 +78,15 @@ void KumquatInstance::SetUp(bool withGl, bool withVk, std::string features) {
 }
 
 KumquatInstance::~KumquatInstance() {
-    virtgpu_kumquat_finish(&mVirtGpu);
+    if (mVirtGpu != nullptr) {
+        virtgpu_kumquat_finish(&mVirtGpu);
+    }
+    // SetUp() assigns mKumquatPid last, so it is still zero if SetUp() failed
+    // before that point. kill(0, ...) signals the whole process group, which
+    // would take down the test runner itself.
+    if (mKumquatPid <= 0) {
+        return;
+    }
     kill(mKumquatPid, SIGKILL);
     int status = 0;
     pid_t pid = waitpid(mKumquatPid, &status, WNOHANG);

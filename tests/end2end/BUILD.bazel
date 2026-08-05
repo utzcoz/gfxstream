@@ -74,6 +74,17 @@ cc_test(
     dynamic_deps = [
         "//guest/OpenglSystemCommon:gfxstream_guest_openglsystemcommon_shared",
     ],
+    linkopts = select({
+        # The generated Vulkan entrypoint tables rely on unimplemented
+        # entrypoints being weak undefined symbols that resolve to NULL. On
+        # macOS this requires allowing undefined symbols to be looked up
+        # dynamically (the same flags the Meson host build uses on Darwin).
+        "@platforms//os:macos": [
+            "-Wl,-undefined,dynamic_lookup",
+            "-Wl,-flat_namespace",
+        ],
+        "//conditions:default": [],
+    }),
     deps = [
         "//common/base:gfxstream_common_base",
         "//common/image:gfxstream_common_image",
@@ -89,10 +100,15 @@ cc_test(
         "//third_party/vulkan:gfxstream_vulkan_headers",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
-        "@drm//:libdrm",
         "@mesa//:mesa_gfxstream_guest_android",
         "@mesa//:mesa_gfxstream_guest_platform",
         "@mesa//:mesa_virtgpu_kumquat_ffi",
         "@rules_cc//cc/runfiles",
-    ],
+    ] + select({
+        # macOS uses the kumquat backend, which does not need libdrm.
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+            "@drm//:libdrm",
+        ],
+    }),
 )
